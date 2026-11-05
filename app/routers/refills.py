@@ -146,7 +146,7 @@ class BatchBody(BaseModel):
     into_pool: bool | None = None
     status: str | None = None
     limit: int = 0            # 一键补号数量上限（0 = 全部）
-    concurrency: int = 1      # 并发数 1-8
+    concurrency: int | None = None  # 1-10；空 = 用系统设置 signup_concurrency
     scope: str | None = None  # delete: failed / all / selected
 
 
@@ -230,7 +230,12 @@ async def batch_refills(body: BatchBody, request: Request):
             if item.get("status") == "failed":
                 store.update_item(iid, status="pending", last_error=None, message="重试")
             run_ids.append(iid)
-        started = runner.start_batch(run_ids, concurrency=body.concurrency)
+        conc = body.concurrency
+        if conc is None:
+            from app.config import get_settings
+
+            conc = get_settings().signup_concurrency
+        started = runner.start_batch(run_ids, concurrency=conc)
         return {
             "ok": True,
             "action": body.action,
@@ -246,7 +251,10 @@ async def batch_refills(body: BatchBody, request: Request):
 async def stop_refills(request: Request):
     require_admin(request)
     out = runner.stop_batch()
-    jobs_keepalive.request_stop()
+    try:
+        jobs_keepalive.request_stop()
+    except Exception:
+        pass
     return {**out, "ok": True}
 
 

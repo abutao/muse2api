@@ -210,6 +210,9 @@ async def _push_pool(item_id: str, email: str, cookie_header: str) -> str | None
         or (email.split("@")[0] if email else item_id)
     )
     label = (email or "").strip() or item_id
+    checkout = meta.get("checkout") if isinstance(meta.get("checkout"), dict) else {}
+    vm_assigned = checkout.get("vm_assigned")
+    assigned_flag = vm_assigned if isinstance(vm_assigned, bool) else None
     _log(item_id, f"准备入本池：账号={label} 名字={display_name} 指纹={fp_id}")
     try:
         acc = pool_store.add_account(
@@ -222,6 +225,7 @@ async def _push_pool(item_id: str, email: str, cookie_header: str) -> str | None
             fingerprint=fp or {"profile_id": fp_id},
             signup_item_id=item_id,
             proxy={"server": item.get("proxy")} if item.get("proxy") else None,
+            assigned=assigned_flag,
         )
     except ValueError as exc:
         msg = str(exc)
@@ -252,6 +256,13 @@ async def _push_pool(item_id: str, email: str, cookie_header: str) -> str | None
             signup_item_id=item_id,
         )
     _log(item_id, f"注册成功 · 已设密 · 已获取Cookie · 指纹={fp_id} · 已导入本库号池 id={aid}")
+    if aid and assigned_flag is False:
+        try:
+            from app.jobs_keepalive import kick_assign
+
+            kick_assign()
+        except Exception:
+            pass
     return aid
 
 
@@ -631,6 +642,9 @@ async def run_until_blocked(item_id: str, *, otp_code: str | None = None) -> dic
     if not item:
         return {"ok": False, "error": "not_found"}
 
+    from app.signup.protocol import current_item_id
+
+    current_item_id.set(item_id)
     secret = store.get_secret(item_id)
     meta = store.get_session_meta(item_id)
     sess = _sess_from_meta(meta)
@@ -765,6 +779,26 @@ async def run_until_blocked(item_id: str, *, otp_code: str | None = None) -> dic
                 display_name=str(profile.get("display_name") or ""),
             )
             _log(item_id, "register-completion OK")
+            sess.checkout = dict(sess.checkout or {})
+            try:
+                leased = await client.lease_vm(sess)
+                vm = ""
+                gw = ""
+                if isinstance(leased, dict):
+                    vm = str(leased.get("vmName") or leased.get("vm_name") or "")
+                    gw = str(leased.get("gatewayUrl") or leased.get("gateway_url") or "")
+                leased_ok = bool(
+                    isinstance(leased, dict)
+                    and (str(leased.get("status") or "") == "assigned" or vm or gw)
+                )
+                sess.checkout["vm_assigned"] = leased_ok
+                if leased_ok:
+                    _log(item_id, f"工作区已租用 vm={vm or '—'} gateway={gw or '—'}")
+                else:
+                    _log(item_id, "工作区还没租到，入池后会自动再分配", "warn")
+            except Exception as exc:  # noqa: BLE001
+                sess.checkout["vm_assigned"] = False
+                _log(item_id, f"租用工作区未成功，注册继续，入池后会自动再分配：{exc}"[:200], "warn")
             return await _after_session(item_id, sess, into_pool=into_pool, email=email)
 
         if status == "awaiting_external_payment":
