@@ -1144,7 +1144,7 @@ async function pageAccounts() {
     try {
       if (act === 'check') { toast('检测中…'); const r = await api(`/api/accounts/${id}/check`, { method: 'POST' }); toast(r.ok
             ? (r.assigned === false
-                ? ('登录态有效 · ' + (r.note || '工作区未分配（等 VM）'))
+                ? ('登录态有效 · ' + (r.note || '工作区未分配（等 VM）').replace(/^登录态有效，?/, ''))
                 : 'Cookie 有效，会话已续签')
             : ('检测失败: ' + (r.error || r.message || r.status)), !r.ok); }
       else if (act === 'quota') { toast('查询额度…'); const r = await api(`/api/accounts/${id}/quota`, { method: 'POST' }); toast(r.found ? (`额度：${r.plan || '?'}，周用量已用 ${r.weekly_used_pct ?? '?'}%`) : ('未读到额度' + (r.error || r.message ? ': ' + (r.error || r.message) : '')), !r.found); }

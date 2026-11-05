@@ -350,18 +350,49 @@ def test_account_session(aid: str) -> dict[str, Any]:
             ok=True,
         )
         assigned = bool(result.get("assigned"))
+        if not assigned:
+            try:
+                provision_vm(aid)
+                result = MuseEngine.renew_session_http(
+                    *pool_store.get_cookies(aid),
+                    wake_vm=True,
+                    proxy=proxy,
+                    require_assigned=False,
+                )
+                assigned = bool(result.get("assigned"))
+                pool_store.apply_session_renewal(
+                    aid,
+                    result.get("cookies") or cookies,
+                    result.get("cookies_exp") or expires,
+                    ok=True,
+                )
+            except Exception as _prov_err:  # noqa: BLE001
+                provision_error = str(_prov_err)[:160]
+        try:
+            pool_store.update(aid, assigned=assigned)
+        except Exception:
+            pass
         row2 = pool_store.get(aid) or {}
         if not row2.get("expires_at"):
             try:
                 pool_store.update(aid, expires_at=int(time.time()) + 30 * 86400)
             except Exception:
                 pass
+        note = ""
+        if not assigned:
+            if "provision_error" in locals() and provision_error:
+                if "403" in provision_error:
+                    note = "账号未完成激活（需先 $1 验卡 + accept-tos），暂时无法租用工作区"
+                else:
+                    note = f"工作区租用失败：{provision_error}"
+            else:
+                note = "工作区尚未分配（等 VM 供货）"
         return {
             "ok": True,
             "assigned": assigned,
             "status": result.get("status"),
             "vm_state": result.get("vm_state"),
-            "note": "" if assigned else "登录态有效，但工作区尚未分配（等 VM 供货）",
+            "note": note,
         }
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
@@ -375,6 +406,54 @@ def test_account_session(aid: str) -> dict[str, Any]:
 
 
 # --- P3: image / video generation -------------------------------------------
+
+def provision_vm(aid: str, vm_type: str = "standard") -> dict[str, Any]:
+    """纯协议租用工作区 VM：POST /api/hatch/lease-vm {"vmType":"standard"}。"""
+    import requests
+
+    from app.config import get_settings
+    from app.muse_engine.browser_proxy import request_proxy_context
+    from app.signup.protocol import expand_proxy_sid, parse_proxy_list
+
+    cookies, _ = pool_store.get_cookies(aid)
+    if not cookies.get("hatch_sess"):
+        raise MuseAuthError("缺少 hatch_sess，无法租用工作区")
+    proxy = pool_store.get_proxy(aid)
+    if not proxy:
+        plist = parse_proxy_list(get_settings().proxies)
+        if plist:
+            proxy = {"server": expand_proxy_sid(plist[0])}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+        "Origin": "https://muse.ai",
+        "Referer": "https://muse.ai/thread/new",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Content-Type": "application/json",
+        "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items() if v),
+    }
+    with request_proxy_context(proxy) as opts:
+        r = requests.post(
+            "https://muse.ai/api/hatch/lease-vm",
+            headers=headers,
+            json={"vmType": vm_type},
+            timeout=45,
+            **opts,
+        )
+    if r.status_code != 200:
+        raise MuseGenerationError(f"lease-vm HTTP {r.status_code}: {r.text[:160]}")
+    data = r.json() if r.content else {}
+    if data.get("status") != "assigned" or not data.get("gatewayUrl"):
+        raise MuseGenerationError(f"lease-vm 未返回 assigned: {str(data)[:160]}")
+    pool_store.update(aid, assigned=True, ok=True, checked=True)
+    return {
+        "ok": True,
+        "vm_name": data.get("vmName"),
+        "vm_id": data.get("vmId"),
+        "gateway": data.get("gatewayUrl"),
+    }
+
 
 def relogin_password(aid: str) -> dict[str, Any]:
     """纯协议密码重登：restart → send-otp → confirm-password，换新 hatch_sess。"""
@@ -442,8 +521,13 @@ def keepalive_account(aid: str) -> dict[str, Any]:
         result.get("cookies_exp") or expires,
         ok=True,
     )
+    try:
+        pool_store.update(aid, assigned=bool(result.get("assigned")))
+    except Exception:
+        pass
     return {
         "ok": True,
+        "assigned": bool(result.get("assigned")),
         "status": result.get("status"),
         "vm_state": result.get("vm_state"),
         "refreshed": result.get("refreshed"),

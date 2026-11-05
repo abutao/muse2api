@@ -571,6 +571,17 @@ async def _finish_activation(
         store.update_item(item_id, status="activating", message="accept-tos / wake…")
         await client.accept_tos(sess)
         _log(item_id, "accept-tos OK")
+        # 激活后才能租工作区：lease-vm 在未验卡/未 accept-tos 时会 403
+        try:
+            lease = await client.lease_vm(sess, "standard")
+            store.save_session_meta(item_id, _meta_from_sess(sess))
+            _log(
+                item_id,
+                f"工作区已租用 vm={(lease or {}).get('vmName')} "
+                f"gateway={str((lease or {}).get('gatewayUrl'))[:50]}",
+            )
+        except MuseProtocolError as exc:
+            _log(item_id, f"工作区租用失败: {exc.status_code} {exc.message}"[:200], "warn")
     else:
         store.update_item(item_id, status="activating", message="wake…")
     # activation order from the capture: accept-tos → stateful-sharing → wake

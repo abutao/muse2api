@@ -162,6 +162,7 @@ def _row_to_public(row: dict[str, Any], *, include_secrets: bool = False) -> dic
         "last_used_at": row.get("last_used_at"),
         "last_keepalive": row.get("last_keepalive_at"),
         "last_keepalive_at": row.get("last_keepalive_at"),
+        "assigned": bool(row.get("assigned")) if row.get("assigned") is not None else None,
         "checked_at": row.get("checked_at"),
         "use_count": int(row.get("use_count") or 0),
         "quota": quota,
@@ -418,6 +419,7 @@ def update(
     bump_use: bool = False,
     checked: bool = False,
     expires_at: int | None = None,
+    assigned: bool | None = None,
 ) -> dict[str, Any] | None:
     row = get(aid)
     if not row:
@@ -457,6 +459,8 @@ def update(
         fields["expires_at"] = account_expiry(new_exp)  # real Cookie expires only
     if expires_at is not None:
         fields["expires_at"] = expires_at
+    if assigned is not None:
+        fields["assigned"] = 1 if assigned else 0
     if touch_used:
         fields["last_used_at"] = now
     if touch_keepalive:
