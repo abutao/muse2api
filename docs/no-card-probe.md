@@ -56,3 +56,32 @@ GET  /api/session?vm_state=live    200 status=none（无 defaultVm）
 
 1. 找是否存在 `productId` 为试用/免费套餐（服务端可能对该 product 跳过 credential）——需要 product 枚举字典；
 2. 观察 `webSandboxActive` / `stripeLinkPaymentIntent` 等字段，看是否有 sandbox 结账通道可被利用。
+
+## 7. 真实下单请求（HAR 反查）
+
+download.devtools 里抓到浏览器真实的下单三连，用于对照产品号：
+
+`
+POST /api/checkout/init
+{amount:1.00,currency:USD,sessionId:upl_...,productId:766358168544755,
+ receiverId:352501280694489,productData:[]}
+
+POST /api/checkout/credential
+{operation:CREATE,uplSessionId:upl_...,ecpCheckoutSessionId:null,
+ orderId:1118011934432327,amount:1.00,currencyCode:USD,
+ paymentContainerMode:LIVE,productId:766358168544755,
+ receiverId:352501280694489,platformTrustToken:...}
+
+POST /api/checkout/finalize
+{ecpCheckoutSessionId:null,orderId:1118011934432327,uplSessionId:upl_...,
+ selectedCredentialId:29369606102725938,credentialType:CREDIT_CARD,
+ countryCode:US,amount:1.00,currencyCode:USD,
+ payButtonClickId:<uuid>,paymentRequestId:<uuid>,platformTrustToken:...}
+`
+
+- 与服务端约定一致：项目 checkout_product_id=766358168544755、checkout_receiver_id=352501280694489、金额 1.00 USD；
+- finalize 必须带 selectedCredentialId（由 /api/checkout/credential 提交真实卡后返回），没有它只会 FAILURE/500。
+
+## 8. 是否有免费试用（free_trial）
+
+前端存在 offerInfo.offerType === free_trial 的分支，但它只挂在**订阅套餐**的 checkout 上（plan change / 订阅升级），与注册时的 $1 Age Verification 无关；没有找到能让 Age Verification 免卡的 offer 或 coupon。
