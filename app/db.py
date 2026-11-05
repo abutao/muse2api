@@ -255,6 +255,7 @@ CREATE TABLE IF NOT EXISTS pool_accounts (
     daily_used INTEGER NOT NULL DEFAULT 0,
     daily_reset_on TEXT,
     e408_streak INTEGER NOT NULL DEFAULT 0,
+    assigned INTEGER,
     expires_at INTEGER,
     last_used_at TEXT,
     last_keepalive_at TEXT,

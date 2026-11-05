@@ -1309,6 +1309,15 @@ class HttpMuseClient:
             },
         )
 
+    async def lease_vm(self, sess: MuseSession, vm_type: str = "standard") -> dict[str, Any]:
+        """租用工作区 VM（status=none 的号靠这一步变 assigned）。"""
+        return await self._request(
+            "POST",
+            "/api/hatch/lease-vm",
+            sess,
+            {"vmType": vm_type},
+        )
+
     async def vm_wake(self, sess: MuseSession) -> dict[str, Any]:
         return await self._request(
             "POST",

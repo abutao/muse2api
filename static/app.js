@@ -1227,8 +1227,10 @@ async function pageAccounts() {
       if (act === 'check') {
         toast('检测中…');
         const r = await api(`/api/accounts/${id}/check`, { method: 'POST' });
-        const waiting = r.ok && r.assigned === false;
-        toast(waiting ? (r.message || '登录态有效，但工作区尚未分配（等 VM 供货）') : (r.ok ? '登录有效，工作区已分配' : ('检测失败: ' + (r.error || r.message || r.status))), !r.ok);
+        const pending = (r.note || r.message || '工作区尚未分配（等 VM 供货）').replace(/^登录态有效[，,·]?\s*/, '');
+        toast(r.ok
+          ? (r.assigned === false ? ('登录态有效 · ' + pending) : '登录有效，工作区已分配')
+          : ('检测失败: ' + (r.error || r.message || r.status)), !r.ok);
       }
       else if (act === 'quota') { toast('查询额度…'); const r = await api(`/api/accounts/${id}/quota`, { method: 'POST' }); toast(r.found ? (`额度：${r.plan || '?'}，周用量已用 ${r.weekly_used_pct ?? '?'}%`) : ('未读到额度' + (r.error || r.message ? ': ' + (r.error || r.message) : '')), !r.found); }
       else if (act === 'toggle') await api('/api/accounts/' + id, { method: 'PATCH', body: { enabled: !a.enabled } });
