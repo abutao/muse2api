@@ -165,6 +165,7 @@ def _row_to_public(row: dict[str, Any], *, include_secrets: bool = False) -> dic
         "last_used_at": row.get("last_used_at"),
         "last_keepalive": row.get("last_keepalive_at"),
         "last_keepalive_at": row.get("last_keepalive_at"),
+        "assigned": bool(row.get("assigned")) if row.get("assigned") is not None else None,
         "checked_at": row.get("checked_at"),
         "use_count": int(row.get("use_count") or 0),
         "quota": quota,
@@ -331,6 +332,9 @@ def add_account(
     ts = _now_ts()
     exp = {k: int(v) for k, v in (cookies_exp or {}).items() if _is_pos(v)}
     expires_at = account_expiry(exp, ts)
+    if expires_at is None and cookies.get("hatch_sess"):
+        # 服务端没回 Set-Cookie 时，按 hatch_sess 的公开 Max-Age(30 天) 估算
+        expires_at = ts + 30 * 86400
     email_v = (email or "").strip()
     label_v = (label or email_v or name or aid).strip()
     name_v = (name or "").strip()
@@ -447,6 +451,7 @@ def update(
     bump_use: bool = False,
     checked: bool = False,
     expires_at: int | None = None,
+    assigned: bool | None = None,
 ) -> dict[str, Any] | None:
     row = get(aid)
     if not row:
@@ -494,6 +499,8 @@ def update(
         fields["expires_at"] = account_expiry(new_exp)  # real Cookie expires only
     if expires_at is not None:
         fields["expires_at"] = expires_at
+    if assigned is not None:
+        fields["assigned"] = 1 if assigned else 0
     if touch_used:
         fields["last_used_at"] = now
     if touch_keepalive:
