@@ -214,3 +214,13 @@ curl -b cj -X POST http://127.0.0.1:8090/api/cards/import \
 - 管理台默认口令必须在首次登录前修改。
 - 导出卡池明文只在管理员本机使用。
 - 文档和示例里的 Key 都是占位符，换成自己的值后再调用。
+
+## 许可
+
+本仓库的代码和文档公开出来，只供技术交流和学习。它不是一项对外服务，也不保证能用于生产。
+
+使用时请自行遵守所在地法律，以及 Muse 等上游服务的条款。不要把它用于未授权访问、批量注册滥用、诈骗或其他侵害他人权益的行为。`app/muse_engine` 内若另有许可文本，以该目录中的声明为准。
+
+## Star
+
+[![Star History Chart](https://api.star-history.com/svg?repos=lichao199208/muse2api&type=Date)](https://www.star-history.com/#lichao199208/muse2api&Date)
