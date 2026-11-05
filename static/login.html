@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>muse-proxy</title>
+<link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+<div class="login-wrap">
+  <form class="login" id="f" autocomplete="on">
+    <div class="logo"><svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 16l.7 1.8L21.5 18.5l-1.8.7L19 21l-.7-1.8-1.8-.7 1.8-.7z"/></svg></div>
+    <h1>muse-proxy</h1>
+    <p>Muse 反代 · 管理后台登录</p>
+    <label class="f">用户名</label>
+    <input type="text" id="u" name="username" value="admin" autocomplete="username" />
+    <label class="f">密码</label>
+    <input type="password" id="p" name="password" autocomplete="current-password" autofocus />
+    <div class="err" id="e"></div>
+    <button class="btn primary block" id="b" type="submit">登 录</button>
+  </form>
+</div>
+<script>
+fetch('/api/me').then(r => { if (r.ok) location.replace('/'); });
+document.getElementById('f').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const b = document.getElementById('b'), e = document.getElementById('e');
+  b.disabled = true; e.textContent = '';
+  try {
+    const r = await fetch('/api/login', { method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ user: document.getElementById('u').value.trim(), password: document.getElementById('p').value }) });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) location.replace('/');
+    else e.textContent = d.error || (d.detail && (d.detail.error || d.detail.message)) || '登录失败';
+  } catch (x) { e.textContent = String(x); }
+  b.disabled = false;
+});
+</script>
+</body>
+</html>

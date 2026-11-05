@@ -1,0 +1,23 @@
+# runtime data & secrets
+data/
+.env
+.tmp/
+logs/
+*.db
+*.db-wal
+*.db-shm
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# node (if any)
+node_modules/
+
+# editor/os
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

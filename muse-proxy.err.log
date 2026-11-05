@@ -1,0 +1,6 @@
+INFO:     Started server process [74512]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8090 (Press CTRL+C to quit)
+chat attempt 1 failed: 号池无可用账号（需 enabled + hatch_sess）
+chat attempt 2 failed: 号池无可用账号（需 enabled + hatch_sess）

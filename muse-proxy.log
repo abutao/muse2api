@@ -1,0 +1,18 @@
+INFO:     127.0.0.1:65373 - "GET /v1/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65373 - "POST /v1/chat/completions HTTP/1.1" 502 Bad Gateway
+INFO:     127.0.0.1:59304 - "POST /api/auth/login HTTP/1.1" 405 Method Not Allowed
+INFO:     127.0.0.1:59304 - "POST /api/settings/test-upstream HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:59304 - "GET /api/overview?range=24h HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:59304 - "GET /api/accounts HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:60280 - "POST /api/auth/login HTTP/1.1" 405 Method Not Allowed
+INFO:     127.0.0.1:60280 - "POST /api/settings/test-upstream HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:60280 - "GET /api/overview?range=24h HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:60280 - "GET /api/accounts HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:65012 - "POST /api/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65012 - "GET /openapi.json HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58144 - "POST /api/login HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58144 - "POST /api/settings/test-upstream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58144 - "GET /api/overview?range=24h HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58144 - "GET /api/accounts HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58144 - "GET /api/settings HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49412 - "POST /v1/images/generations HTTP/1.1" 503 Service Unavailable
