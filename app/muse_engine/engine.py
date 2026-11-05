@@ -533,7 +533,8 @@ class MuseEngine:
 
     @staticmethod
     def renew_session_http(cookies: dict, expires: dict | None = None,
-                           wake_vm: bool = True, proxy: dict | None = None) -> dict:
+                           wake_vm: bool = True, proxy: dict | None = None,
+                           require_assigned: bool = True) -> dict:
         """调用 muse.ai/api/session?vm_state=live 续签会话 Cookie。
 
         以响应真实 Set-Cookie 为准（hatch_vml Max-Age=172800 ≈2 天，hatch_sess 2592000 ≈30 天），
@@ -573,14 +574,41 @@ class MuseEngine:
                 sj = r.json()
             except ValueError:
                 raise MuseGenerationError("/api/session HTTP 200 返回非 JSON；会话状态未确认") from None
-            if not isinstance(sj, dict) or sj.get("status") != "assigned":
-                raise MuseGenerationError("/api/session HTTP 200 未返回 assigned 会话；请在官网检查账号/工作区状态")
+            if not isinstance(sj, dict):
+                raise MuseGenerationError("/api/session HTTP 200 返回非对象 JSON")
+            if sj.get("status") != "assigned" and require_assigned:
+                raise MuseGenerationError(
+                    "/api/session HTTP 200 未返回 assigned 会话；请在官网检查账号/工作区状态"
+                )
             for c in r.cookies:
                 if c.value:
                     cur_cookies[c.name] = c.value
                 if c.expires:
                     cur_exp[c.name] = int(float(c.expires))
+            # requests 不保证把每个 Set-Cookie 都放进 jar，这里再手工解析一遍
+            try:
+                import re as _re
+
+                _now = time.time()
+                for _raw in r.headers.get_list("set-cookie") or []:
+                    _part = _raw.split(";", 1)[0]
+                    if "=" not in _part:
+                        continue
+                    _name, _val = _part.split("=", 1)
+                    _name = _name.strip()
+                    _val = _val.strip()
+                    if not _name or not _val:
+                        continue
+                    cur_cookies[_name] = _val
+                    _m = _re.search(r"max-age=(\d+)", _raw, _re.I)
+                    if _m:
+                        cur_exp[_name] = int(_now) + int(_m.group(1))
+            except Exception:
+                pass
             vm_id = sj.get("vm_id")
+            assigned = sj.get("status") == "assigned"
+            if not assigned and not require_assigned and wake_vm:
+                wake_vm = False
             vm_state = sj.get("vm_state")
             wake_ok = False
             wake_requested = False
@@ -616,7 +644,8 @@ class MuseEngine:
                     pass
             refreshed = (r.headers.get("x-hatch-session-refreshed") or "").strip() == "1"
             return {
-                "ok": sj.get("status") == "assigned",
+                "ok": True if not require_assigned else sj.get("status") == "assigned",
+                "assigned": sj.get("status") == "assigned",
                 "refreshed": refreshed,
                 "status": sj.get("status"),
                 "vm_id": vm_id,

@@ -341,7 +341,7 @@ def test_account_session(aid: str) -> dict[str, Any]:
             proxy = None
     try:
         result = MuseEngine.renew_session_http(
-            cookies, expires, wake_vm=True, proxy=proxy
+            cookies, expires, wake_vm=True, proxy=proxy, require_assigned=False
         )
         pool_store.apply_session_renewal(
             aid,
@@ -349,12 +349,19 @@ def test_account_session(aid: str) -> dict[str, Any]:
             result.get("cookies_exp") or result.get("expires") or expires,
             ok=True,
         )
+        assigned = bool(result.get("assigned"))
+        row2 = pool_store.get(aid) or {}
+        if not row2.get("expires_at"):
+            try:
+                pool_store.update(aid, expires_at=int(time.time()) + 30 * 86400)
+            except Exception:
+                pass
         return {
             "ok": True,
-            "status": (result.get("session") or {}).get("status")
-            if isinstance(result.get("session"), dict)
-            else "assigned",
+            "assigned": assigned,
+            "status": result.get("status"),
             "vm_state": result.get("vm_state"),
+            "note": "" if assigned else "登录态有效，但工作区尚未分配（等 VM 供货）",
         }
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
@@ -416,14 +423,18 @@ def keepalive_account(aid: str) -> dict[str, Any]:
     try:
         if not cookies.get("hatch_sess"):
             raise MuseAuthError("missing hatch_sess")
-        result = MuseEngine.renew_session_http(cookies, expires, wake_vm=True, proxy=proxy)
+        result = MuseEngine.renew_session_http(
+            cookies, expires, wake_vm=True, proxy=proxy, require_assigned=False
+        )
     except MuseAuthError:
         if not pool_store.get_password(aid):
             raise
         relogin_password(aid)
         relogged = True
         cookies, expires = pool_store.get_cookies(aid)
-        result = MuseEngine.renew_session_http(cookies, expires, wake_vm=True, proxy=proxy)
+        result = MuseEngine.renew_session_http(
+            cookies, expires, wake_vm=True, proxy=proxy, require_assigned=False
+        )
 
     pool_store.apply_session_renewal(
         aid,
@@ -454,7 +465,7 @@ def quota(aid: str) -> dict[str, Any]:
             proxy = None
     try:
         renewed = MuseEngine.renew_session_http(
-            cookies, expires, wake_vm=True, proxy=proxy
+            cookies, expires, wake_vm=True, proxy=proxy, require_assigned=False
         )
         cookies = renewed.get("cookies") or cookies
         expires = renewed.get("cookies_exp") or renewed.get("expires") or expires
@@ -462,6 +473,14 @@ def quota(aid: str) -> dict[str, Any]:
     except MuseAuthError:
         pool_store.update(aid, ok=False, checked=True)
         raise
+    if not renewed.get("assigned"):
+        # 工作区没分配时页面里没有额度面板，直接给出明确原因，避免照旧报错
+        return {
+            "found": False,
+            "reason": "workspace_not_assigned",
+            "status": renewed.get("status"),
+            "message": "工作区尚未分配（等 VM 供货），暂时读不到额度",
+        }
     eng = get_engine()
     return eng.quota(cookies, expires, account_id=aid)
 

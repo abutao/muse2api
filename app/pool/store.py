@@ -302,6 +302,9 @@ def add_account(
     ts = _now_ts()
     exp = {k: int(v) for k, v in (cookies_exp or {}).items() if _is_pos(v)}
     expires_at = account_expiry(exp, ts)
+    if expires_at is None and cookies.get("hatch_sess"):
+        # 服务端没回 Set-Cookie 时，按 hatch_sess 的公开 Max-Age(30 天) 估算
+        expires_at = ts + 30 * 86400
     email_v = (email or "").strip()
     label_v = (label or email_v or name or aid).strip()
     name_v = (name or "").strip()
