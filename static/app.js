@@ -63,15 +63,27 @@ let timer = null;
 const GALLERY_MAX = 9;
 const jobs = []; // live + recent gallery cards (capped at GALLERY_MAX)
 
+function errText(v) {
+  if (v == null || v === '') return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (typeof v !== 'object') return String(v);
+  if (typeof v.message === 'string' && v.message) return v.message;
+  if (typeof v.error === 'string' && v.error) return v.error;
+  if (v.error && typeof v.error === 'object') return errText(v.error);
+  if (typeof v.detail === 'string' && v.detail) return v.detail;
+  if (v.detail && typeof v.detail === 'object') return errText(v.detail);
+  if (typeof v.code === 'string' || typeof v.code === 'number') {
+    const msg = typeof v.message === 'string' ? v.message : '';
+    return msg ? (msg + ' (' + v.code + ')') : String(v.code);
+  }
+  try { return JSON.stringify(v); } catch (_) { return Object.prototype.toString.call(v); }
+}
 function apiErr(d, status) {
   if (!d) return httpLabel(status);
   if (typeof d === 'string') return friendlyErr(d);
-  if (d.error) return friendlyErr(typeof d.error === 'string' ? d.error : JSON.stringify(d.error));
-  if (d.message) return friendlyErr(d.message);
-  if (d.detail) {
-    if (typeof d.detail === 'string') return friendlyErr(d.detail);
-    if (d.detail.error || d.detail.message) return friendlyErr(d.detail.message || d.detail.error);
-  }
+  const nested = errText(d.error) || errText(d.message) || errText(d.detail) || errText(d);
+  if (nested && nested !== '[object Object]') return friendlyErr(nested);
   return httpLabel(status);
 }
 async function api(path, opt = {}) {
@@ -83,7 +95,7 @@ async function api(path, opt = {}) {
   try { d = await r.json(); } catch (_) {}
   if (!r.ok && !opt.soft) throw new Error(apiErr(d, r.status));
   if (d && typeof d === 'object' && d.status == null && !r.ok) d.status = r.status;
-  if (d && typeof d === 'object' && d.error) d.error = friendlyErr(typeof d.error === 'string' ? d.error : JSON.stringify(d.error));
+  if (d && typeof d === 'object' && d.error) d.error = friendlyErr(errText(d.error));
   return d;
 }
 let consoleToken = null, consoleTokenExp = 0;
@@ -99,7 +111,22 @@ async function v1api(path, opt = {}) {
   if (opt.body !== undefined) { o.headers['Content-Type'] = 'application/json'; o.body = JSON.stringify(opt.body); }
   const r = await fetch(path, o);
   let d = null; try { d = await r.json(); } catch (_) {}
-  if (!r.ok && !opt.soft) throw new Error(apiErr(d, r.status));
+  // Console tokens live only in server memory; restart/expiry yields local 401 — remint once.
+  if ((r.status === 401 || r.status === 403) && !opt._authRetried) {
+    consoleToken = null; consoleTokenExp = 0;
+    return v1api(path, Object.assign({}, opt, { _authRetried: true }));
+  }
+  if (!r.ok) {
+    const msg = apiErr(d, r.status) || httpLabel(r.status);
+    if (!opt.soft) throw new Error(msg);
+    return {
+      ok: false,
+      http_status: r.status,
+      status: 'error',
+      error: msg,
+      code: (d && d.detail && d.detail.error && d.detail.error.code) || (d && d.error && d.error.code) || r.status,
+    };
+  }
   if (d && typeof d === 'object') {
     d.http_status = r.status;
     // Keep upstream string statuses (queued/completed); only fill numeric HTTP when absent
@@ -789,8 +816,10 @@ async function pageGenerate() {
       else if (failed || d.error) httpStatus = 0;
       else httpStatus = d.ok ? 200 : 200;
     }
-    const err = failed ? (d.error || d.message || stRaw || '失败')
+    let err = failed ? (d.error || d.message || stRaw || '失败')
       : (urls.length || doneOk ? (d.error || null) : (d.error || null));
+    if (httpStatus >= 400 && !err) err = apiErr(d, httpStatus);
+    err = err ? errText(err) : null;
     Object.assign(j, {
       state: 'done',
       status: httpStatus,
@@ -922,8 +951,22 @@ async function pageGenerate() {
       let t;
       try { t = await v1api(pollPath, { soft: true }); } catch (_) { continue; }
       if (!t) continue;
+      // Local auth/proxy HTTP failures are not task terminal states.
+      if (typeof t.http_status === 'number' && t.http_status >= 400) {
+        if (t.http_status === 401 || t.http_status === 403) {
+          applyJobDone(j, { status: 'error', error: errText(t.error) || ('本地鉴权失败 ' + t.http_status + '（控制台 Token 失效，请刷新页面重试）'), http_status: t.http_status }, t0);
+          render();
+          return;
+        }
+        if (t.http_status === 429) {
+          applyJobDone(j, { status: 'error', error: '请求过频 429，已停止轮询', http_status: 429 }, t0);
+          render();
+          return;
+        }
+        continue;
+      }
       const st = String(t.status || t.state || '').toLowerCase();
-      if (!st || st === 'queued' || st === 'running' || st === 'in_progress' || st === 'processing') continue;
+      if (!st || st === 'queued' || st === 'running' || st === 'in_progress' || st === 'processing' || st === '401' || st === '403') continue;
       if (/^(completed|succeeded|success|done)$/.test(st) && !extractJobUrls(t).length) continue;
       applyJobDone(j, Object.assign({}, t, { http_status: t.http_status || 200 }), t0);
       render();
@@ -1343,10 +1386,10 @@ async function pageSettings() {
   const groups = [];
   const tab = (id, label, desc, icon, cards) => groups.push({ id, label, desc, icon, cards });
   tab('engine', '引擎与性能', '生成引擎、超时并发与媒体策略', IC.engine, [
-    card('生成引擎', '本地 CDP 浏览器引擎与对外访问地址', `
+    card('生成引擎', '纯协议 Noise 或旧 CDP 引擎，以及对外访问地址', `
       <div class="form-grid">
         <div class="span2"><label class="f">引擎后端</label>
-          <input type="text" id="engine_backend" value="local" readonly /></div>
+          <select id="engine_backend"><option value="protocol">纯协议 protocol（Noise + chat.stream，无 Chromium）</option><option value="cdp">旧浏览器 cdp / local</option></select></div>
         <div class="span2"><label class="f">Chromium 路径（空=自动探测）</label><input type="text" id="chromium_path" value="${esc(s.chromium_path || '')}" placeholder="/usr/bin/google-chrome" /></div>
         <div><label class="f">CDP 端口</label><input type="number" id="cdp_port" value="${s.cdp_port ?? 19211}" min="1024" max="65535" /></div>
         <div><label class="f">引擎并发</label><input type="number" id="engine_concurrency" value="${s.engine_concurrency ?? 2}" min="1" max="32" /></div>
@@ -1442,7 +1485,7 @@ async function pageSettings() {
   $('#charge_on_upstream_error').value = String(!!s.charge_on_upstream_error);
   $('#default_into_pool').value = String(s.default_into_pool !== false);
   $('#proxy_scheduled_keepalive').value = String(!!s.proxy_scheduled_keepalive);
-  const eb=$('#engine_backend'); if(eb) eb.value='local';
+  const eb=$('#engine_backend'); if(eb) eb.value=(s.engine_backend === 'local' || s.engine_backend === 'cdp') ? 'cdp' : 'protocol';
 
   async function loadKeys() {
     let d; try { d = await api('/api/settings/keys'); } catch (e) { $('#ktb').innerHTML = `<tr><td colspan="6">${esc(e.message)}</td></tr>`; return; }
@@ -1504,7 +1547,7 @@ async function pageSettings() {
       const r = await api('/api/settings/test-engine', { method: 'POST' });
       const local = r.local || {};
       const msg = r.ok
-        ? ('引擎 OK · local · chrome=' + (local.chromium || '') + ' · 号池 ' + ((local.pool && local.pool.total) || 0))
+        ? ('引擎 OK · ' + (local.backend || 'unknown') + ' · ' + (local.backend === 'protocol' ? '无 Chromium' : ('chrome=' + (local.chromium || ''))) + ' · 号池 ' + ((local.pool && local.pool.total) || 0))
         : ('引擎异常: ' + (local.error || local.message || ''));
       toast(msg, !r.ok);
     } catch (e) { toast(e.message, true); }
@@ -1548,7 +1591,7 @@ async function pageSettings() {
   $('#save').onclick = async () => {
     const body = {
       public_base: $('#public_base').value.trim(),
-      engine_backend: 'local',
+      engine_backend: ($('#engine_backend') && $('#engine_backend').value) || 'protocol',
       chromium_path: ($('#chromium_path') && $('#chromium_path').value.trim()) || '',
       cdp_port: parseInt(($('#cdp_port') && $('#cdp_port').value) || '19211', 10),
       engine_concurrency: parseInt(($('#engine_concurrency') && $('#engine_concurrency').value) || '2', 10),

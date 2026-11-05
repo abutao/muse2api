@@ -75,11 +75,12 @@ def normalize_proxy_entry(entry: str) -> str:
     """Accept common provider formats and turn them into a URL.
 
     Supported (all optionally with ``{sid}``):
-      * ``socks5h://user:pass@host:port`` (as-is)
+      * ``http(s)/socks URL`` (kept as-is; userinfo is not re-encoded)
       * ``user:pass@host:port``
       * ``host:port``
-      * ``host:port:user:pass``            (udealproxy / iproyal style)
-      * ``host:port:user:pass:socks5``     (scheme as 5th field)
+      * ``host:port:user:pass`` (default scheme http; password may contain ``:``)
+      * ``host:port:user:pass:socks5`` (exact 5 fields when password has no ``:``)
+      * ``[ipv6]:port:user:pass``
     """
     raw = (entry or "").strip()
     if not raw:
@@ -87,22 +88,38 @@ def normalize_proxy_entry(entry: str) -> str:
     low = raw.lower()
     if low.startswith(_PROXY_SCHEMES):
         return raw
-    scheme = "socks5h"
-    parts = raw.split(":")
-    if len(parts) >= 5 and parts[4].strip().lower() in ("http", "https", "socks4", "socks5", "socks5h"):
-        scheme = parts[4].strip().lower()
-        parts = parts[:4]
-    if "@" in raw and len(parts) == 2:
-        return f"{scheme}://{raw}"
-    if len(parts) == 2 and parts[1].isdigit():
-        return f"{scheme}://{parts[0]}:{parts[1]}"
-    if len(parts) == 4 and parts[1].isdigit():
-        host, port, user, pwd = parts
-        return f"{scheme}://{user}:{pwd}@{host}:{port}"
-    # already user:pass@host:port with a scheme-looking tail or unknown shape
-    if "@" in raw:
-        return f"{scheme}://{raw}"
-    return raw
+    try:
+        from app.muse_engine.browser_proxy import parse_proxy_string
+        from urllib.parse import quote, urlsplit
+
+        parsed = parse_proxy_string(raw)
+        if not parsed:
+            return ""
+        parts = urlsplit(parsed["server"])
+        user = parsed.get("username")
+        pwd = parsed.get("password")
+        if user is None and pwd is None:
+            return parsed["server"]
+        auth = quote(str(user or ""), safe="") + ":" + quote(str(pwd or ""), safe="")
+        return f"{parts.scheme}://{auth}@{parts.netloc}"
+    except Exception:
+        scheme = "http"
+        exact = raw.split(":")
+        if len(exact) == 5 and exact[1].isdigit() and exact[4].strip().lower() in (
+            "http", "https", "socks4", "socks5", "socks5h"
+        ):
+            scheme = exact[4].strip().lower()
+            host, port, user, pwd = exact[0], exact[1], exact[2], exact[3]
+            return f"{scheme}://{user}:{pwd}@{host}:{port}"
+        if "@" in raw:
+            return f"{scheme}://{raw}"
+        parts = raw.split(":", 3)
+        if len(parts) == 2 and parts[1].isdigit():
+            return f"{scheme}://{parts[0]}:{parts[1]}"
+        if len(parts) == 4 and parts[1].isdigit():
+            host, port, user, pwd = parts
+            return f"{scheme}://{user}:{pwd}@{host}:{port}"
+        return raw
 
 
 def parse_proxy_list(raw: str | None) -> list[str]:

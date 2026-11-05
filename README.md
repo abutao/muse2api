@@ -19,7 +19,21 @@
 | 号池 | 区分「已注册待分配」和「可用」；待分配的号会自动去租工作区 |
 | 管理台 | 总览、生图生视频、对话、生成记录、号池、卡池、补号、设置 |
 
-对外只暴露 `/v1`。调用方带自己的 Key，网关选号、续会话、回写媒体地址。Cookie 和卡号不出现在列表和日志里。
+对外只暴露 `/v1`。默认走纯协议引擎选号与生成；调用方带自己的 Key，网关选号、暖连接复用、回写媒体地址。Cookie 和卡号不出现在列表和日志里。
+
+## 协议引擎（默认）
+
+默认 `ENGINE_BACKEND=protocol`：经 Noise WebSocket + `chat.stream` 直接请求 Muse，不再依赖本机 Chromium/CDP。
+
+| 项 | 说明 |
+|----|------|
+| 文本 / 图片 | `/v1` 已实测可走协议路径；图片结果会本地转为真实 PNG 交付 |
+| 视频 | 协议链路已实现；大规模端到端验收仍有限，请按任务实际结果为准 |
+| 代理 | 支持 `host:port:user:pass` 四段字符串（默认 http，密码可含冒号），以及原有 URL / `user:pass@host:port` / IPv6 |
+| 连接复用 | 同账号可复用已建立的 Noise 会话与订阅（暖连接），降低重复 bootstrap |
+| 并发 | **同号串行**（文本默认同号 1；图/视频始终串行）；跨号可并行，受号池与上游限额约束 |
+| 计时 | 非流式 `/v1/chat/completions` 响应含 `muse_timing`（匿名 account_slot、reuse、renew/bootstrap 等，不含 prompt/密钥） |
+| 未支持 | confidential / 未处理的 CVM 资格不会静默回退 CDP；断线自动完整恢复策略仍有限，失败时按现有轮换与重试处理 |
 
 ## 环境
 
@@ -42,6 +56,8 @@ cp .env.example .env
 | `ADMIN_PASSWORD` | 管理台登录密码，不要沿用 `change-me` |
 | `SESSION_SECRET` | 会话签名 |
 | `MUSE_PROXY_KEY` | 调用 `/v1` 的对外 Key |
+
+可选：`ENGINE_BACKEND=protocol`（默认）或 `cdp`/`local`（Chromium）。
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8090
@@ -177,7 +193,7 @@ curl -b cj -X POST http://127.0.0.1:8090/api/cards/import \
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `PORT` / `PUBLIC_BASE` | `8090` | 监听端口，以及写进媒体链接的对外根地址 |
-| `ENGINE_BACKEND` | `local` | 本地引擎。生成不依赖外部 muse2api |
+| `ENGINE_BACKEND` | `protocol` | `protocol`：Noise XX + `chat.stream` 纯协议生成，不启动 Chromium；`cdp`（或旧值 `local`）：保留的 Chromium/CDP 引擎。设置页也可切换；管理台运行时覆盖优先于 `.env` |
 | `SIGNUP_CLIENT` | `http` | `http` 走真实站点；`mock` 只用于本地演练 |
 | `SIGNUP_MUSE_BASE` | `https://muse.ai` | 注册协议的站点根地址 |
 | `SIGNUP_TLS_IMPERSONATE` | `chrome` | 浏览器 TLS 指纹；`off` 则退回普通 HTTP 客户端 |

@@ -8,56 +8,282 @@ import select
 import socket
 import socketserver
 import threading
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlunsplit, urlsplit
+
+_PROXY_SCHEMES = ("http", "https", "socks4", "socks4a", "socks5", "socks5h")
+_PROXY_PREFIXES = tuple(f"{name}://" for name in _PROXY_SCHEMES)
+_SCHEME_ALIAS = {
+    "http": "http",
+    "https": "http",  # CONNECT-style HTTP proxy
+    "socks4": "socks5",
+    "socks4a": "socks5h",
+    "socks5": "socks5",
+    "socks5h": "socks5h",
+}
+
+
+def _is_ipv6_literal(host: str) -> bool:
+    try:
+        return isinstance(ipaddress.ip_address(host.strip("[]")), ipaddress.IPv6Address)
+    except ValueError:
+        return False
+
+
+def format_proxy_host(host: str) -> str:
+    """Return a host suitable for URLs; IPv6 literals are bracketed once."""
+    raw = (host or "").strip()
+    if not raw:
+        raise ValueError("Proxy host is required")
+    if raw.startswith("["):
+        if not raw.endswith("]") or len(raw) < 4:
+            raise ValueError("IPv6 proxy host must look like [2001:db8::1]")
+        inner = raw[1:-1]
+        if not _is_ipv6_literal(inner):
+            raise ValueError("Invalid IPv6 proxy host in brackets")
+        return f"[{ipaddress.IPv6Address(inner).compressed}]"
+    if _is_ipv6_literal(raw):
+        return f"[{ipaddress.IPv6Address(raw).compressed}]"
+    if ":" in raw:
+        raise ValueError(
+            "IPv6 proxy hosts must be bracketed, e.g. [2001:db8::1]:8080:user:pass"
+        )
+    if any(c in raw for c in "/\\@%"):
+        raise ValueError("Proxy host contains invalid characters")
+    try:
+        return raw.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError("Proxy host is not a valid hostname") from exc
+
+
+def _validate_port(port: str | int) -> int:
+    try:
+        value = int(port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Proxy port must be an integer") from exc
+    if not 1 <= value <= 65535:
+        raise ValueError("Proxy port must be between 1 and 65535")
+    return value
+
+
+def _split_colon_proxy(raw: str) -> tuple[str, str, str, str, str]:
+    """Parse host:port[:user[:pass]] with at most 3 splits so passwords may contain ':'."""
+    text = raw.strip()
+    scheme = "http"
+    # Classic 5-field form without ':' inside the password: host:port:user:pass:scheme
+    exact = text.split(":")
+    if (
+        len(exact) == 5
+        and exact[1].isdigit()
+        and exact[4].strip().lower() in _PROXY_SCHEMES
+        and not exact[0].startswith("[")
+    ):
+        host, port, user, password, scheme = (p.strip() for p in exact)
+        return scheme, host, port, user, password
+
+    if text.startswith("["):
+        end = text.find("]")
+        if end < 0:
+            raise ValueError("IPv6 proxy host is missing a closing ']'")
+        host = text[: end + 1]
+        rest = text[end + 1 :]
+        if not rest.startswith(":"):
+            raise ValueError("IPv6 proxy must look like [address]:port:user:pass")
+        exact_tail = rest[1:].split(":")
+        # Exact [addr]:port:user:pass:scheme when password has no ':'
+        if (
+            len(exact_tail) == 4
+            and exact_tail[0].isdigit()
+            and exact_tail[3].lower() in _PROXY_SCHEMES
+        ):
+            port, user, password, scheme = exact_tail[0], exact_tail[1], exact_tail[2], exact_tail[3]
+            return scheme, host, port, user, password
+        pieces = rest[1:].split(":", 2)
+        if len(pieces) == 1:
+            port, user, password = pieces[0], "", ""
+        elif len(pieces) == 2:
+            port, user, password = pieces[0], pieces[1], ""
+        else:
+            port, user, password = pieces[0], pieces[1], pieces[2]
+        return scheme, host, port, user, password
+
+    parts = text.split(":", 3)
+    if len(parts) == 2:
+        host, port = parts
+        return scheme, host, port, "", ""
+    if len(parts) == 3:
+        host, port, user = parts
+        return scheme, host, port, user, ""
+    if len(parts) == 4:
+        host, port, user, password = parts
+        return scheme, host, port, user, password
+    raise ValueError(
+        "Unsupported proxy format; use http://host:port, user:pass@host:port, "
+        "or host:port:user:pass (password may contain ':')"
+    )
+
+
+def parse_proxy_string(entry: str | None) -> dict | None:
+    """Normalize one proxy line into {server, username?, password?} without embedding userinfo.
+
+    Accepted forms:
+      * http(s)/socks URL (userinfo optional; decoded once into separate fields)
+      * user:pass@host:port
+      * host:port
+      * host:port:user:pass   (default scheme http; password may contain ':')
+      * host:port:user:pass:socks5  (exact 5 fields when password has no ':')
+      * [ipv6]:port:user:pass
+    """
+    raw = (entry or "").strip()
+    if not raw:
+        return None
+    if any(c.isspace() or ord(c) < 32 for c in raw):
+        raise ValueError("Proxy value contains whitespace or control characters")
+
+    low = raw.lower()
+    if low.startswith(_PROXY_PREFIXES):
+        parsed = urlsplit(raw)
+        scheme = _SCHEME_ALIAS.get(parsed.scheme)
+        if not scheme:
+            raise ValueError(f"Unsupported proxy scheme: {parsed.scheme}")
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            raise ValueError("Proxy URL must not include path, query, or fragment")
+        host = parsed.hostname
+        if not host:
+            raise ValueError("Proxy URL is missing a host")
+        port = parsed.port
+        if port is None:
+            port = 1080 if scheme.startswith("socks") else 80
+        host_fmt = format_proxy_host(host)
+        out = {"server": f"{scheme}://{host_fmt}:{_validate_port(port)}"}
+        # Decode userinfo once; callers must not quote again into server.
+        if parsed.username is not None:
+            out["username"] = unquote(parsed.username)
+        if parsed.password is not None:
+            out["password"] = unquote(parsed.password)
+        return out
+
+    # Prefer host:port:user:pass before user:pass@host:port so passwords may contain '@'.
+    colon_candidate = False
+    if raw.startswith("["):
+        colon_candidate = True
+    else:
+        head = raw.split(":", 2)
+        if len(head) >= 2 and head[1].isdigit() and "@" not in head[0]:
+            colon_candidate = True
+
+    if colon_candidate:
+        scheme, host, port, user, password = _split_colon_proxy(raw)
+        scheme = _SCHEME_ALIAS.get(scheme.strip().lower(), "http")
+        host_fmt = format_proxy_host(host)
+        out = {"server": f"{scheme}://{host_fmt}:{_validate_port(port)}"}
+        if user:
+            out["username"] = user
+        if password:
+            out["password"] = password
+        return out
+
+    if "@" in raw:
+        userinfo, _, hostport = raw.rpartition("@")
+        if not userinfo or not hostport:
+            raise ValueError("Proxy userinfo must look like user:pass@host:port")
+        if hostport.startswith("["):
+            scheme, host, port, _u, _p = _split_colon_proxy(hostport)
+        else:
+            hp = hostport.split(":", 1)
+            if len(hp) != 2:
+                raise ValueError("Proxy hostport must include a port")
+            host, port = hp
+            scheme = "http"
+        if ":" in userinfo:
+            user, password = userinfo.split(":", 1)
+        else:
+            user, password = userinfo, ""
+        host_fmt = format_proxy_host(host)
+        scheme = _SCHEME_ALIAS.get(scheme, "http")
+        out = {"server": f"{scheme}://{host_fmt}:{_validate_port(port)}"}
+        if user:
+            out["username"] = user
+        if password:
+            out["password"] = password
+        return out
+
+    raise ValueError(
+        "Unsupported proxy format; use http://host:port, user:pass@host:port, "
+        "or host:port:user:pass (password may contain ':' or '@')"
+    )
 
 
 def normalize_server(value: str) -> str:
     """Accept HTTP or SOCKS5 proxy origins; credentials use separate fields."""
     try:
-        parsed = urlsplit(value.strip())
-        port = parsed.port if parsed.port is not None else (1080 if parsed.scheme in ("socks5", "socks5h") else 80)
-        host = parsed.hostname
-        if (parsed.scheme not in ("http", "socks5", "socks5h") or not host or parsed.username is not None
-                or parsed.password is not None or parsed.path not in ("", "/")
-                or parsed.query or parsed.fragment or not 1 <= port <= 65535
-                or any(c.isspace() or ord(c) < 32 for c in value)
-                or any(c in host for c in "/\\@%")):
-            raise ValueError
-        host = f"[{host}]" if ":" in host else host.encode("idna").decode("ascii")
-        return f"{parsed.scheme}://{host}:{port}"
-    except (ValueError, UnicodeError):
-        raise ValueError("Use http://host:port or socks5://host:port; enter username and password separately") from None
+        parsed_dict = parse_proxy_string(value)
+        if not parsed_dict:
+            raise ValueError("empty")
+        if parsed_dict.get("username") or parsed_dict.get("password"):
+            # Origins used by Chromium relay must not carry userinfo.
+            return parsed_dict["server"]
+        return parsed_dict["server"]
+    except ValueError as exc:
+        raise ValueError(
+            "Use http://host:port, socks5://host:port, host:port:user:pass, "
+            "or [ipv6]:port:user:pass; enter username/password separately when possible"
+        ) from exc
 
 
 def public_proxy(proxy: dict | None) -> dict | None:
     if not proxy:
         return None
-    return {"server": proxy["server"], "username": proxy.get("username", ""),
-            "has_password": bool(proxy.get("password"))}
+    normalized = normalize_proxy_dict(proxy) or {}
+    return {
+        "server": normalized.get("server", ""),
+        "username": normalized.get("username", ""),
+        "has_password": bool(normalized.get("password")),
+    }
 
 
 def normalize_proxy_dict(proxy: dict | None) -> dict | None:
-    """把 {server: "socks5h://user:pass@host:port"} 拆成 server + username/password。"""
+    """Normalize proxy dicts and colon/URL strings into server + separate credentials."""
     if not proxy:
         return proxy
-    url = str(proxy.get("server") or "").strip()
-    if not url:
-        return proxy
-    parsed = urlsplit(url)
+    if isinstance(proxy, str):
+        return parse_proxy_string(proxy)
+
+    server = str(proxy.get("server") or "").strip()
     user = proxy.get("username")
     pwd = proxy.get("password")
-    if not user and parsed.username:
-        user = unquote(parsed.username)
-    if not pwd and parsed.password:
-        pwd = unquote(parsed.password)
-    host = parsed.hostname or ""
-    port = f":{parsed.port}" if parsed.port else ""
-    scheme = parsed.scheme or "http"
-    out = {"server": f"{scheme}://{host}{port}"}
+    if not server:
+        return None
+
+    # If server itself is a compact provider line / URL, parse it first.
+    try:
+        parsed = parse_proxy_string(server)
+    except ValueError:
+        parsed = None
+    if parsed:
+        out = {"server": parsed["server"]}
+        # Explicit fields win; otherwise take decoded userinfo once.
+        if user:
+            out["username"] = str(user)
+        elif parsed.get("username"):
+            out["username"] = parsed["username"]
+        if pwd:
+            out["password"] = str(pwd)
+        elif parsed.get("password"):
+            out["password"] = parsed["password"]
+        return out
+
+    # Already a clean scheme://host:port with separate auth fields.
+    try:
+        clean = parse_proxy_string(
+            server if "://" in server else f"http://{server}"
+        )
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    out = {"server": clean["server"]}
     if user:
-        out["username"] = user
+        out["username"] = str(user)
     if pwd:
-        out["password"] = pwd
+        out["password"] = str(pwd)
     return out
 
 
@@ -66,10 +292,21 @@ def request_proxies(proxy: dict | None) -> dict:
     if not proxy:
         return {}
     parsed = urlsplit(proxy["server"])
+    host = parsed.hostname or ""
+    port = parsed.port
+    host_fmt = format_proxy_host(host)
+    netloc = f"{host_fmt}:{port}" if port else host_fmt
     auth = ""
-    if proxy.get("username") or proxy.get("password"):
-        auth = quote(proxy.get("username", ""), safe="") + ":" + quote(proxy.get("password", ""), safe="") + "@"
-    url = f"http://{auth}{parsed.netloc}"
+    if proxy.get("username") is not None or proxy.get("password") is not None:
+        # Quote once here for requests; server field itself never embeds userinfo.
+        auth = (
+            quote(str(proxy.get("username") or ""), safe="")
+            + ":"
+            + quote(str(proxy.get("password") or ""), safe="")
+            + "@"
+        )
+    # requests expects an HTTP proxy URL for both http/https targets.
+    url = f"http://{auth}{netloc}"
     return {"proxies": {"http": url, "https": url}}
 
 

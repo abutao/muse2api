@@ -19,7 +19,7 @@ def _public_config() -> dict[str, Any]:
     s = get_settings()
     return {
         "public_base": s.public_base,
-        "engine_backend": "local",
+        "engine_backend": str(getattr(s, "engine_backend", "protocol") or "protocol"),
         "chromium_path": getattr(s, "chromium_path", "") or "",
         "cdp_port": getattr(s, "cdp_port", 19211),
         "engine_concurrency": getattr(s, "engine_concurrency", 2),
@@ -82,7 +82,7 @@ async def settings_get(request: Request):
 
 class SettingsPatch(BaseModel):
     public_base: str | None = None
-    engine_backend: str | None = None  # forced local; ignored if upstream
+    engine_backend: str | None = None  # protocol (default), cdp, or legacy local
     chromium_path: str | None = None
     cdp_port: int | None = None
     engine_concurrency: int | None = None
@@ -142,8 +142,11 @@ async def settings_patch(body: SettingsPatch, request: Request):
         else:
             data.pop("admin_password", None)
 
-    # Force local; clear any upstream dual-run leftovers
-    data["engine_backend"] = "local"
+    # Protocol is default; cdp/local retain the legacy browser engine.
+    backend = str(data.get("engine_backend") or get_settings().engine_backend or "protocol").strip().lower()
+    if backend not in ("protocol", "cdp", "local"):
+        raise HTTPException(400, detail={"error": "invalid_engine_backend", "allowed": ["protocol", "cdp"]})
+    data["engine_backend"] = backend
     data["upstream_base_url"] = ""
     data["upstream_api_key"] = ""
 
@@ -160,31 +163,37 @@ async def settings_patch(body: SettingsPatch, request: Request):
 @router.post("/test-upstream")
 @router.post("/test-engine")
 async def test_engine(request: Request):
-    """Local muse_engine health (Chromium + pool). Path /test-upstream kept as alias."""
+    """Report selected engine readiness without starting Chromium for protocol."""
     require_admin(request)
     from app.pool import store as pool_store
     from app.muse_engine.config import detect_chromium, load_engine_config
+    from app.muse_engine.service import engine_backend
 
-    local: dict[str, Any] = {"ok": False, "backend": "local"}
+    backend = engine_backend()
     try:
         cfg = load_engine_config()
-        chrome = detect_chromium()
         stats = pool_store.stats()
-        local = {
-            "ok": bool(chrome),
-            "backend": "local",
-            "chromium": chrome,
-            "cdp_port": cfg.cdp_port,
-            "pool": stats,
-            "message": "local muse_engine ready" if chrome else "chromium not found",
-        }
-    except Exception as exc:  # noqa: BLE001
-        local = {"ok": False, "backend": "local", "error": str(exc)}
+        if backend == "protocol":
+            from app.muse_engine.protocol_client import HatchProtocolClient  # noqa: F401
+            from app.muse_engine.protocol_engine import ProtocolEngine  # noqa: F401
 
+            local = {
+                "ok": True, "backend": "protocol", "protocol": "Noise XX + chat.stream",
+                "chromium_required": False, "pool": stats,
+                "message": "pure protocol engine ready (no Chromium)",
+            }
+        else:
+            chrome = detect_chromium()
+            local = {
+                "ok": bool(chrome), "backend": backend, "chromium": chrome,
+                "cdp_port": cfg.cdp_port, "pool": stats,
+                "message": "CDP muse_engine ready" if chrome else "chromium not found",
+            }
+    except Exception as exc:  # noqa: BLE001
+        local = {"ok": False, "backend": backend, "error": str(exc)}
     return {
-        "ok": bool(local.get("ok")),
-        "local": local,
-        "health": {"ok": True, "skipped": True, "message": "no UPSTREAM (local only)"},
+        "ok": bool(local.get("ok")), "local": local,
+        "health": {"ok": True, "skipped": True, "message": "no external upstream"},
         "admin": {"ok": True, "skipped": True},
     }
 

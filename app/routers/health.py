@@ -20,7 +20,7 @@ def healthz() -> dict:
         "service": "muse-proxy",
         "version": __version__,
         "db": str(path.name),
-        "engine_backend": "local",
+        "engine_backend": str(getattr(settings, "engine_backend", "local") or "local").strip().lower(),
         "upstream": "",  # P5: always empty
         "outbound_keys_configured": bool(settings.outbound_keys()),
         "upstream_key_configured": False,

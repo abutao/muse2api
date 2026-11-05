@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import threading
@@ -21,7 +22,59 @@ from app.pool import store as pool_store
 
 logger = logging.getLogger("muse-proxy.muse_engine")
 
-_engine: MuseEngine | None = None
+
+def _account_slot(account_id: str | None) -> str:
+    """Anonymous stable slot label (A/B/C…) — never the raw account id."""
+    if not account_id:
+        return "?"
+    try:
+        rows = pool_store.list_raw()
+        ids = sorted(str(r.get("id") or "") for r in rows if r.get("id"))
+        if account_id in ids:
+            return chr(ord("A") + (ids.index(account_id) % 26))
+    except Exception:
+        pass
+    return chr(ord("A") + (abs(hash(account_id)) % 26))
+
+
+def _new_request_timing() -> dict[str, Any]:
+    return {
+        "request_id": uuid.uuid4().hex[:12],
+        "account_slot": None,
+        "reuse": False,
+        "lock_wait_ms": None,
+        "pick_ms": None,
+        "renew_ms": None,
+        "renew_skipped": False,
+        "bootstrap_ms": None,
+        "first_delta_ms": None,
+        "done_ms": None,
+        "total_ms": None,
+        "unattributed_ms": None,
+    }
+
+
+def _finalize_timing(timing: dict[str, Any], t0: float) -> dict[str, Any]:
+    timing["total_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    known = 0.0
+    for key in ("lock_wait_ms", "pick_ms", "renew_ms", "bootstrap_ms"):
+        val = timing.get(key)
+        if isinstance(val, (int, float)):
+            known += float(val)
+    done = timing.get("done_ms")
+    if isinstance(done, (int, float)):
+        pre = 0.0
+        for key in ("lock_wait_ms", "pick_ms", "renew_ms", "bootstrap_ms"):
+            val = timing.get(key)
+            if isinstance(val, (int, float)):
+                pre += float(val)
+        timing["generation_ms"] = round(max(0.0, float(done) - pre), 1)
+        known += float(timing["generation_ms"])
+    timing["unattributed_ms"] = round(max(0.0, float(timing["total_ms"]) - known), 1)
+    return timing
+
+_engine: Any = None
+_protocol_engine: Any = None
 _cfg: EngineConfig | None = None
 _lock = threading.Lock()
 _gen_sem: asyncio.Semaphore | None = None
@@ -41,17 +94,33 @@ def engine_config() -> EngineConfig:
     return _cfg
 
 
-def get_engine() -> MuseEngine:
-    global _engine
+def engine_backend() -> str:
+    from app.config import get_settings
+
+    value = str(getattr(get_settings(), "engine_backend", "local") or "local").strip().lower()
+    # local is retained as the backward-compatible CDP spelling.
+    return "cdp" if value == "local" else value
+
+
+def get_engine() -> Any:
+    global _engine, _protocol_engine
+    backend = engine_backend()
+    if backend not in ("cdp", "protocol"):
+        raise MuseGenerationError(
+            f"Unsupported ENGINE_BACKEND={backend!r}; use protocol or cdp"
+        )
     with _lock:
+        if backend == "protocol":
+            if _protocol_engine is None:
+                from app.muse_engine.protocol_engine import ProtocolEngine
+
+                _protocol_engine = ProtocolEngine(engine_config())
+                logger.info("muse_engine ready backend=protocol (Noise + chat.stream)")
+            return _protocol_engine
         if _engine is None:
             cfg = engine_config()
             _engine = MuseEngine(cfg)
-            logger.info(
-                "muse_engine ready chromium=%s cdp=%s",
-                cfg.chromium,
-                cfg.cdp_port,
-            )
+            logger.info("muse_engine ready backend=cdp chromium=%s cdp=%s", cfg.chromium, cfg.cdp_port)
         return _engine
 
 
@@ -65,14 +134,34 @@ def _gen_semaphore() -> asyncio.Semaphore:
 
 
 def _account_proxy(acc: dict[str, Any]) -> dict | None:
-    # public view strips password; load raw
-    row = pool_store.get(str(acc.get("id") or ""))
-    if not row or not row.get("proxy_json"):
+    # Per-account proxy wins; otherwise retain the legacy global proxy pool.
+    # Always normalize to server + separate username/password for HTTP and WS.
+    from app.config import get_settings
+    from app.muse_engine.browser_proxy import normalize_proxy_dict, parse_proxy_string
+    from app.signup.protocol import expand_proxy_sid, parse_proxy_list
+
+    row = pool_store.get(str(acc.get("id") or "")) or {}
+    try:
+        configured = json.loads(row["proxy_json"]) if row.get("proxy_json") else None
+    except json.JSONDecodeError:
+        configured = None
+    if configured:
+        try:
+            return normalize_proxy_dict(configured)
+        except ValueError as exc:
+            raise MuseGenerationError(f"Invalid account proxy: {exc}") from None
+    proxies = parse_proxy_list(get_settings().proxies)
+    if not proxies:
         return None
     try:
-        return json.loads(row["proxy_json"])
-    except json.JSONDecodeError:
-        return None
+        digest = int(hashlib.sha256(str(acc.get("id") or "").encode()).hexdigest()[:8], 16)
+    except Exception:
+        digest = 0
+    expanded = expand_proxy_sid(proxies[digest % len(proxies)])
+    try:
+        return parse_proxy_string(expanded)
+    except ValueError as exc:
+        raise MuseGenerationError(f"Invalid pool proxy: {exc}") from None
 
 
 def _pick(force_rotate: bool = False, exclude_ids: set[str] | None = None) -> dict[str, Any]:
@@ -81,6 +170,47 @@ def _pick(force_rotate: bool = False, exclude_ids: set[str] | None = None) -> di
     cap = int(getattr(cfg, "acct_global_daily_cap", 0) or 0)
     if cap and pool_store.global_daily_used() >= cap:
         raise MuseGenerationError("全号每日上限已到（acct_global_daily_cap），请稍后再试")
+    blocked = set(exclude_ids or set())
+
+    # Protocol warm sticky: reuse live Noise worker even inside min_interval.
+    if (
+        engine_backend() == "protocol"
+        and _sticky_id
+        and not force_rotate
+        and _sticky_id not in blocked
+    ):
+        try:
+            from app.muse_engine.protocol_pool import has_warm_worker
+
+            if has_warm_worker(_sticky_id):
+                warm = pool_store.get_public(_sticky_id, include_secrets=True)
+                if warm and warm.get("enabled", 1) and warm.get("assigned") != 0:
+                    cd = warm.get("cooldown_until")
+                    if not (cd and int(cd) > int(time.time())):
+                        _sticky_id = str(warm["id"])
+                        return warm
+        except Exception:
+            pass
+
+    # Prefer any already-warm idle worker (do not wake new accounts).
+    if engine_backend() == "protocol" and not force_rotate:
+        try:
+            from app.muse_engine.protocol_pool import warm_account_ids
+
+            for wid in warm_account_ids():
+                if wid in blocked:
+                    continue
+                warm = pool_store.get_public(wid, include_secrets=True)
+                if not warm or not warm.get("enabled", 1) or warm.get("assigned") == 0:
+                    continue
+                cd = warm.get("cooldown_until")
+                if cd and int(cd) > int(time.time()):
+                    continue
+                _sticky_id = str(warm["id"])
+                return warm
+        except Exception:
+            pass
+
     acc = pool_store.pick_account(
         preferred_id=_sticky_id,
         force_rotate=force_rotate,
@@ -95,11 +225,21 @@ def _pick(force_rotate: bool = False, exclude_ids: set[str] | None = None) -> di
     return acc
 
 
-def _renew_if_needed(acc: dict[str, Any]) -> tuple[dict[str, str], dict]:
+def _renew_if_needed(
+    acc: dict[str, Any], *, skip_http_if_warm: bool = False
+) -> tuple[dict[str, str], dict]:
     cookies = dict(acc.get("cookies") or {})
     expires = dict(acc.get("cookies_exp") or {})
     if not cookies:
         cookies, expires = pool_store.get_cookies(str(acc["id"]))
+    if skip_http_if_warm and engine_backend() == "protocol":
+        try:
+            from app.muse_engine.protocol_pool import has_warm_worker
+
+            if has_warm_worker(str(acc.get("id") or "")) and cookies:
+                return cookies, expires
+        except Exception:
+            pass
     proxy = _account_proxy(acc)
     try:
         result = MuseEngine.renew_session_http(
@@ -144,61 +284,100 @@ def _messages_to_prompt(body: dict[str, Any]) -> str:
     return "\n\n".join(parts).strip() or "hi"
 
 
-def _sync_chat_stream(prompt: str, *, timeout: int | None = None) -> Iterator[str]:
+def _note_account_failure(acc_id: str, exc: Exception) -> None:
+    """Apply 403/408 cooldowns without leaking upstream payloads."""
+    if not acc_id:
+        return
+    msg_l = str(exc)
+    cfg2 = engine_config()
+    try:
+        if "403" in msg_l:
+            pool_store.note_cooldown(
+                acc_id, int(getattr(cfg2, "acct_403_stop_hours", 24)) * 60
+            )
+        elif "408" in msg_l:
+            pool_store.note_cooldown(
+                acc_id,
+                int(getattr(cfg2, "acct_408_cooldown_min", 3)),
+                streak=True,
+                disable_at=int(getattr(cfg2, "acct_408_disable_streak", 3)),
+                cap_min=int(getattr(cfg2, "acct_cooldown_cap_min", 30)),
+            )
+    except Exception:
+        pass
+
+
+def _sync_chat_stream(
+    prompt: str,
+    *,
+    timeout: int | None = None,
+    timing: dict[str, Any] | None = None,
+) -> Iterator[str]:
     engine = get_engine()
     engine.start()
     last_err: Exception | None = None
-    for attempt in range(2):
+    cfg2 = engine_config()
+    max_attempts = max(2, min(int(getattr(cfg2, "acct_rotate_attempts", 5) or 5), 8))
+    tried_ids: set[str] = set()
+    timing = timing if timing is not None else _new_request_timing()
+    t0 = time.perf_counter()
+    for attempt in range(max_attempts):
+        acc: dict[str, Any] = {}
         try:
-            acc = _pick(force_rotate=attempt > 0)
-            cookies, expires = _renew_if_needed(acc)
+            t_pick = time.perf_counter()
+            acc = _pick(force_rotate=attempt > 0, exclude_ids=set(tried_ids))
+            timing["pick_ms"] = round((time.perf_counter() - t_pick) * 1000, 1)
+            aid = str(acc.get("id") or "")
+            tried_ids.add(aid)
+            timing["account_slot"] = _account_slot(aid)
+            warm = False
+            if engine_backend() == "protocol":
+                try:
+                    from app.muse_engine.protocol_pool import has_warm_worker
+                    warm = has_warm_worker(aid)
+                except Exception:
+                    warm = False
+            timing["reuse"] = bool(warm)
+            t_renew = time.perf_counter()
+            cookies, expires = _renew_if_needed(acc, skip_http_if_warm=warm)
+            timing["renew_ms"] = round((time.perf_counter() - t_renew) * 1000, 1)
+            timing["renew_skipped"] = bool(warm and timing["renew_ms"] < 50)
+            timeline: list[dict[str, Any]] = []
+            first_delta_set = False
             for delta in engine.chat_stream(
                 cookies,
                 prompt,
                 expires,
                 timeout=timeout,
-                account_id=str(acc["id"]),
+                account_id=aid,
+                timeline=timeline,
+                **({"proxy": _account_proxy(acc)} if engine_backend() == "protocol" else {}),
             ):
+                if not first_delta_set and delta:
+                    timing["first_delta_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+                    first_delta_set = True
                 yield delta
+            timing["done_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+            for item in timeline:
+                if isinstance(item, dict) and item.get("timings_ms"):
+                    tm = item["timings_ms"]
+                    if tm.get("reuse"):
+                        timing["reuse"] = True
+                    if "bootstrap_ms" in tm:
+                        timing["bootstrap_ms"] = tm.get("bootstrap_ms")
+                    if "lock_wait_ms" in tm:
+                        timing["lock_wait_ms"] = tm.get("lock_wait_ms")
+                    break
+            _finalize_timing(timing, t0)
+            pool_store.note_use(aid)
+            pool_store.reset_408(aid)
             return
         except (MuseAuthError, MuseProxyError, MuseGenerationError) as exc:
             last_err = exc
-            _log(f"失败: {exc}", "err")
-            msg_l = str(exc)
-            acc_id = str(acc_row.get("id") or "")
-            if acc_id:
-                try:
-                    if "403" in msg_l:
-                        pool_store.note_cooldown(
-                            acc_id, int(getattr(cfg2, "acct_403_stop_hours", 24)) * 60
-                        )
-                    elif "408" in msg_l:
-                        pool_store.note_cooldown(
-                            acc_id,
-                            int(getattr(cfg2, "acct_408_cooldown_min", 3)),
-                            streak=True,
-                            disable_at=int(getattr(cfg2, "acct_408_disable_streak", 3)),
-                            cap_min=int(getattr(cfg2, "acct_cooldown_cap_min", 30)),
-                        )
-                except Exception:
-                    pass
-            attempts.append(
-                {
-                    "at": int(at0 * 1000),
-                    "account": _acc_label(acc_row) if acc_row else "",
-                    "accountId": str(acc_row.get("id") or "") if acc_row else "",
-                    "ticket": "",
-                    "profile": "",
-                    "sid": "",
-                    "region": "",
-                    "status": 500,
-                    "outcome": "http_error",
-                    "ms": int((time.time() - at0) * 1000),
-                    "error": str(exc)[:300],
-                }
-            )
+            _note_account_failure(str(acc.get("id") or ""), exc)
             logger.warning("chat attempt %s failed: %s", attempt + 1, exc)
             continue
+    _finalize_timing(timing, t0)
     raise last_err or MuseGenerationError("chat failed")
 
 
@@ -209,6 +388,7 @@ async def chat_completions(body: dict[str, Any]) -> Any:
     prompt = _messages_to_prompt(body)
     stream = bool(body.get("stream"))
     model = body.get("model") or "muse-spark"
+    timing = _new_request_timing()
     timeout = body.get("timeout")
     try:
         timeout_i = int(timeout) if timeout is not None else None
@@ -224,7 +404,7 @@ async def chat_completions(body: dict[str, Any]) -> Any:
 
             def _run() -> str:
                 out = ""
-                for d in _sync_chat_stream(prompt, timeout=timeout_i):
+                for d in _sync_chat_stream(prompt, timeout=timeout_i, timing=timing):
                     out += d
                 return out
 
@@ -246,6 +426,7 @@ async def chat_completions(body: dict[str, Any]) -> Any:
                     "completion_tokens": 0,
                     "total_tokens": 0,
                 },
+                "muse_timing": timing,
             }
         finally:
             sem.release()
@@ -255,7 +436,7 @@ async def chat_completions(body: dict[str, Any]) -> Any:
 
     def _producer() -> None:
         try:
-            for d in _sync_chat_stream(prompt, timeout=timeout_i):
+            for d in _sync_chat_stream(prompt, timeout=timeout_i, timing=timing):
                 asyncio.run_coroutine_threadsafe(queue.put(d), loop).result()
             asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
         except Exception as exc:  # noqa: BLE001
@@ -279,6 +460,7 @@ async def chat_completions(body: dict[str, Any]) -> Any:
                         "choices": [
                             {"index": 0, "delta": {}, "finish_reason": "stop"}
                         ],
+                        "muse_timing": timing,
                     }
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
                     yield b"data: [DONE]\n\n"
@@ -318,6 +500,7 @@ async def chat_completions(body: dict[str, Any]) -> Any:
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
+            "X-Muse-Request-Id": str(timing.get("request_id") or ""),
         },
     )
 
@@ -699,7 +882,7 @@ def run_generation(
     reference_images: list[str] | None = None,
     on_progress=None,
 ) -> tuple[dict[str, Any], str]:
-    """Run CDP generate; returns (result_dict, account_id)."""
+    """Run the selected protocol/CDP backend; returns (result_dict, account_id)."""
     engine = get_engine()
     engine.start()
     cfg = engine_config()
@@ -756,8 +939,9 @@ def run_generation(
                 reference_images=reference_images or None,
                 on_log=lambda m: _log(m),
                 fingerprint=acc_fp,
+                **({"proxy": _account_proxy(acc)} if engine_backend() == "protocol" else {}),
             )
-            _log(f"出图完成 · 用时 {time.time() - t0:.1f}s · 文件 {res.get('filename')}")
+            _log(f"生成完成 · 用时 {time.time() - t0:.1f}s · 文件 {res.get('filename')}")
             attempts.append(
                 {
                     "at": int(at0 * 1000),
@@ -780,6 +964,22 @@ def run_generation(
             return res, str(acc["id"])
         except (MuseAuthError, MuseProxyError, MuseGenerationError) as exc:
             last_err = exc
+            _note_account_failure(str(acc_row.get("id") or ""), exc)
+            attempts.append(
+                {
+                    "at": int(at0 * 1000),
+                    "account": _acc_label(acc_row) if acc_row else "",
+                    "accountId": str(acc_row.get("id") or "") if acc_row else "",
+                    "ticket": "",
+                    "profile": "",
+                    "sid": "",
+                    "region": "",
+                    "status": 500,
+                    "outcome": "http_error",
+                    "ms": int((time.time() - at0) * 1000),
+                    "error": str(exc)[:300],
+                }
+            )
             logger.warning("%s attempt %s failed: %s", expect, attempt + 1, exc)
             continue
     raise last_err or MuseGenerationError(f"{expect} failed")

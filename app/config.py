@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     # Deprecated dual-run muse2api (must stay empty; P5 removed _fwd/19080)
     upstream_base_url: str = Field(
-        default="",  # deprecated dual-run; prefer ENGINE_BACKEND=local
+        default="",  # deprecated dual-run; prefer ENGINE_BACKEND=protocol
         validation_alias=AliasChoices(
             "upstream_base_url", "UPSTREAM_BASE_URL", "UPSTREAM_BASE"
         ),
@@ -82,9 +82,9 @@ class Settings(BaseSettings):
     record_keep_days: int = 30
     charge_on_upstream_error: bool = False
 
-    # Generation backend: local only (upstream dual-run removed)
+    # Generation backend: protocol (Noise) default; cdp/local keep Chromium
     engine_backend: str = Field(
-        default="local",
+        default="protocol",
         validation_alias=AliasChoices(
             "engine_backend", "ENGINE_BACKEND", "MUSE_ENGINE_BACKEND"
         ),
@@ -103,6 +103,15 @@ class Settings(BaseSettings):
         default=2,
         validation_alias=AliasChoices(
             "engine_concurrency", "ENGINE_CONCURRENCY", "MUSE_ENGINE_CONCURRENCY"
+        ),
+    )
+    # Same-account protocol text concurrency (1=serial; max 2 when verified).
+    # Image/video remain serial. Does not bypass upstream rate limits.
+    protocol_account_text_concurrency: int = Field(
+        default=1,
+        validation_alias=AliasChoices(
+            "protocol_account_text_concurrency",
+            "PROTOCOL_ACCOUNT_TEXT_CONCURRENCY",
         ),
     )
 

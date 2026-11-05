@@ -631,5 +631,15 @@ async def get_media(
 
     path = Path(media_path(name))
     if path.is_file():
-        return FileResponse(path)
+        suffix = path.suffix.lower()
+        media_types = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+            ".mp4": "video/mp4",
+            ".webm": "video/webm",
+        }
+        return FileResponse(path, media_type=media_types.get(suffix))
     raise openai_http_error(404, "media not found", code="not_found")

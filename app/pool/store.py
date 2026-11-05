@@ -451,7 +451,6 @@ def update(
     bump_use: bool = False,
     checked: bool = False,
     expires_at: int | None = None,
-    assigned: bool | None = None,
 ) -> dict[str, Any] | None:
     row = get(aid)
     if not row:

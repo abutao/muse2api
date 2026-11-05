@@ -19,7 +19,7 @@ init_db()
 # clear persisted dual-run UPSTREAM overrides (P5)
 try:
     from app.runtime_settings import set_overrides
-    set_overrides({"upstream_base_url": "", "upstream_api_key": "", "engine_backend": "local"})
+    set_overrides({"upstream_base_url": "", "upstream_api_key": ""})
 except Exception:
     pass
 

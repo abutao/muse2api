@@ -1,0 +1,36 @@
+syntax = "proto3";
+package hatch.noise;
+message NoiseTransportFrame {
+  optional int64 chunk_id = 1;
+  optional uint32 chunk_index = 2;
+  optional uint32 total_chunks = 3;
+  optional bytes payload = 4;
+}
+message ServiceRequest { ServiceType service = 1; bytes payload = 2; }
+message ServiceResponse { bytes payload = 1; }
+message ServiceFrame {
+  int64 stream_id = 1;
+  oneof kind {
+    ApplicationRequest request = 2;
+    ApplicationResponse response = 3;
+    BodyChunk body_chunk = 4;
+    Reset reset = 5;
+  }
+}
+message Header { string key = 1; string value = 2; }
+message ApplicationRequest {
+  string verb = 1; string path = 2; repeated Header headers = 3;
+  bytes body = 4; bool end_body = 5;
+}
+message ApplicationResponse {
+  int32 status = 1; repeated Header headers = 2;
+  bytes body = 3; bool end_body = 4;
+}
+message BodyChunk { bytes data = 1; bool end_body = 2; }
+message Reset {
+  Code code = 1; string reason = 2;
+  enum Code { CODE_UNSPECIFIED=0; CANCELLED=1; TIMEOUT=2; PROTOCOL_ERROR=3;
+              REFUSED_STREAM=4; INTERNAL_ERROR=5; SERVICE_UNAVAILABLE=6; }
+}
+enum ServiceType { SERVICE_DAEMON=0; SERVICE_SENTINEL=1; SERVICE_VAULT=2;
+                   SERVICE_AUTHD=3; SERVICE_SSH_ACCESS=4; SERVICE_YOLK=5; }
