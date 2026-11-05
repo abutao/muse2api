@@ -89,25 +89,50 @@ def extract_task_id_from_path(path: str | None) -> str | None:
     return None
 
 
+def finish_task_log(
+    upstream_task_id: str | None,
+    *,
+    media_urls: list[str] | None = None,
+    status: int | None = None,
+    error: str | None = None,
+) -> None:
+    """把创建任务那条日志更新成最终结果，避免画廊里再留一张「已受理」。"""
+    if not upstream_task_id:
+        return
+    sets: list[str] = []
+    args: list[Any] = []
+    if media_urls:
+        sets.append("media_urls = ?")
+        args.append(json.dumps(media_urls, ensure_ascii=False))
+    if status is not None:
+        sets.append("status = ?")
+        args.append(int(status))
+    if error is not None:
+        sets.append("error = ?")
+        args.append((error or "")[:500] or None)
+    if not sets:
+        return
+    args.append(upstream_task_id)
+    try:
+        with get_db() as conn:
+            conn.execute(
+                f"""
+                UPDATE call_logs
+                SET {", ".join(sets)}
+                WHERE upstream_task_id = ?
+                  AND UPPER(method) = 'POST'
+                """,
+                args,
+            )
+    except Exception:
+        logger.exception("failed to finish task log")
+
+
 def backfill_create_media_urls(upstream_task_id: str | None, media_urls: list[str] | None) -> None:
     """Write poll media_urls onto the matching POST create log (same upstream_task_id)."""
     if not upstream_task_id or not media_urls:
         return
-    try:
-        payload = json.dumps(media_urls, ensure_ascii=False)
-        with get_db() as conn:
-            conn.execute(
-                """
-                UPDATE call_logs
-                SET media_urls = ?
-                WHERE upstream_task_id = ?
-                  AND UPPER(method) = 'POST'
-                  AND (media_urls IS NULL OR media_urls = '' OR media_urls = '[]')
-                """,
-                (payload, upstream_task_id),
-            )
-    except Exception:
-        logger.exception("failed to backfill create media_urls")
+    finish_task_log(upstream_task_id, media_urls=media_urls, status=200)
 
 
 def collect_media_urls(payload: Any, limit: int = 8) -> list[str]:

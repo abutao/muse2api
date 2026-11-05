@@ -205,8 +205,17 @@ async def list_records(
         where.append("status IS NULL")
 
     if api_type.strip():
-        where.append("api_type = ?")
-        args.append(api_type.strip())
+        types = [x.strip() for x in api_type.split(",") if x.strip()]
+        if len(types) == 1:
+            where.append("api_type = ?")
+            args.append(types[0])
+        elif types:
+            where.append("api_type IN (" + ",".join("?" * len(types)) + ")")
+            args.extend(types)
+    else:
+        # 生成记录只看生图 / 生视频，对话另算
+        where.append("ifnull(api_type,'') != 'chat'")
+        where.append("ifnull(path,'') NOT LIKE '%/chat/completions%'")
     if source.strip():
         where.append("source = ?")
         args.append(source.strip())
@@ -267,6 +276,7 @@ class DeleteBody(BaseModel):
     mode: Literal["failed", "before_days", "ids", "all"] = "failed"
     days: int | None = Field(default=30, ge=1, le=3650)
     ids: list[int] | None = None
+    exclude_api_type: str | None = None
 
 
 @router.post("/delete")
@@ -274,10 +284,16 @@ async def delete_records(body: DeleteBody, request: Request):
     require_admin(request)
     # Skip "running" (status IS NULL)
     skip = " AND status IS NOT NULL"
+    extra = ""
+    extra_args: list[Any] = []
+    if (body.exclude_api_type or "").strip():
+        extra = " AND ifnull(api_type,'') != ?"
+        extra_args.append(body.exclude_api_type.strip())
     with get_db() as conn:
         if body.mode == "failed":
             cur = conn.execute(
-                f"DELETE FROM call_logs WHERE status >= 400{skip}"
+                f"DELETE FROM call_logs WHERE status >= 400{skip}{extra}",
+                extra_args,
             )
         elif body.mode == "before_days":
             days = int(body.days or 30)
@@ -285,9 +301,9 @@ async def delete_records(body: DeleteBody, request: Request):
                 f"""
                 DELETE FROM call_logs
                 WHERE created_at < datetime('now', ?)
-                {skip}
+                {skip}{extra}
                 """,
-                (f"-{days} days",),
+                (f"-{days} days", *extra_args),
             )
         elif body.mode == "ids":
             ids = [int(x) for x in (body.ids or []) if int(x) > 0]
@@ -299,7 +315,10 @@ async def delete_records(body: DeleteBody, request: Request):
                 ids,
             )
         elif body.mode == "all":
-            cur = conn.execute(f"DELETE FROM call_logs WHERE 1=1{skip}")
+            cur = conn.execute(
+                f"DELETE FROM call_logs WHERE 1=1{skip}{extra}",
+                extra_args,
+            )
         else:
             raise HTTPException(status_code=400, detail={"error": "bad_mode"})
         deleted = cur.rowcount
