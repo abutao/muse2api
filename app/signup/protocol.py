@@ -8,6 +8,7 @@ import random
 import string
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -135,6 +136,40 @@ def mask_proxy_url(url: str | None) -> str:
         return "***"
 
 
+current_item_id: ContextVar[str] = ContextVar("signup_item_id", default="")
+
+
+def fresh_sticky_proxy() -> str:
+    """Pick one proxy line and mint a new 8-char `{sid}`."""
+    raw = getattr(get_settings(), "proxies", "") or ""
+    if "{sid}" not in raw:
+        return ""
+    return pick_proxy(raw) or ""
+
+
+def _proxyish(exc: BaseException) -> bool:
+    blob = f"{type(exc).__name__} {exc}".lower()
+    keys = (
+        "proxy", "connect", "timeout", "timed out", "ssl", "eof",
+        "reset", "refused", "unreachable", "curl", "407", "502", "503", "504",
+    )
+    return any(k in blob for k in keys)
+
+
+def _rotate_proxy(sess: Any, nth: int) -> bool:
+    """Swap in a new sticky SID. Returns False when there is nothing to rotate."""
+    new = fresh_sticky_proxy()
+    if not new or new == (getattr(sess, "proxy_url", "") or ""):
+        return False
+    sess.proxy_url = new
+    iid = current_item_id.get()
+    if iid:
+        from app.signup.store import add_log
+
+        add_log(iid, "warn", f"代理这条小路堵住了，换一条新的再走（第 {nth} 次）")
+    return True
+
+
 def expand_proxy_sid(url: str | None, sid: str | None = None) -> str:
     """Expand the provider's `{sid}` placeholder into one sticky session id.
 
@@ -237,6 +272,7 @@ class MuseClient(Protocol):
     async def bootstrap(self, sess: MuseSession) -> dict[str, Any]: ...
     async def accept_tos(self, sess: MuseSession) -> dict[str, Any]: ...
     async def vm_wake(self, sess: MuseSession) -> dict[str, Any]: ...
+    async def lease_vm(self, sess: MuseSession, vm_type: str = "standard") -> dict[str, Any]: ...
     async def checkout_init(
         self,
         sess: MuseSession,
@@ -639,6 +675,14 @@ class MockMuseClient:
     async def vm_wake(self, sess: MuseSession) -> dict[str, Any]:
         return {"status": "wake_requested", "ok": True}
 
+    async def lease_vm(self, sess: MuseSession, vm_type: str = "standard") -> dict[str, Any]:
+        return {
+            "status": "assigned",
+            "vmName": "mock-vm",
+            "gatewayUrl": "wss://mock.metaaivm.com/",
+            "vmType": vm_type or "standard",
+        }
+
     async def onboarding_state(self, sess: MuseSession) -> dict[str, Any]:
         return {
             "ok": True,
@@ -885,38 +929,38 @@ class HttpMuseClient:
         cookie = self._cookie_header(sess)
         if cookie:
             headers["cookie"] = cookie
-        proxy = self._resolve_proxy(sess)
-        try:
-            res = await http_send(
-                method,
-                url,
-                headers=headers,
-                json_body=None if form is not None else (json_body if json_body is not None else {}),
-                form=form,
-                proxy=proxy,
-                follow_redirects=False,
-            )
-        except httpx.ProxyError as exc:
-            raise MuseProtocolError(
-                0,
-                f"proxy_error:{type(exc).__name__}",
-                {
-                    "error": str(exc)[:400],
-                    "proxy": mask_proxy_url(proxy),
-                    "url": url,
-                },
-            ) from exc
-        except Exception as exc:  # noqa: BLE001 — curl_cffi + httpx transport errors
-            raise MuseProtocolError(
-                0,
-                f"transport_error:{type(exc).__name__}",
-                {
-                    "error": str(exc)[:400],
-                    "proxy": mask_proxy_url(proxy),
-                    "proxy_used": bool(proxy),
-                    "url": url,
-                },
-            ) from exc
+        res = None
+        proxy = ""
+        for attempt in range(3):
+            proxy = self._resolve_proxy(sess)
+            try:
+                res = await http_send(
+                    method,
+                    url,
+                    headers=headers,
+                    json_body=None if form is not None else (json_body if json_body is not None else {}),
+                    form=form,
+                    proxy=proxy,
+                    follow_redirects=False,
+                )
+            except Exception as exc:  # noqa: BLE001 — curl_cffi + httpx
+                if attempt < 2 and _proxyish(exc) and _rotate_proxy(sess, attempt + 1):
+                    continue
+                kind = "proxy_error" if isinstance(exc, httpx.ProxyError) else "transport_error"
+                raise MuseProtocolError(
+                    0,
+                    f"{kind}:{type(exc).__name__}",
+                    {
+                        "error": str(exc)[:400],
+                        "proxy": mask_proxy_url(proxy),
+                        "proxy_used": bool(proxy),
+                        "url": url,
+                    },
+                ) from exc
+            if res.status_code in (407, 502, 503, 504) and attempt < 2 and _rotate_proxy(sess, attempt + 1):
+                continue
+            break
+        assert res is not None
         for k, v in res.cookies().items():
             sess.cookies[k] = v
             if k == "hatch_sess":
@@ -1284,6 +1328,16 @@ class HttpMuseClient:
                 "retry_count": 0,
                 "connect_attempt_id": str(uuid.uuid4()),
             },
+        )
+
+    async def lease_vm(self, sess: MuseSession, vm_type: str = "standard") -> dict[str, Any]:
+        """租一台工作区。合法值只有 standard / confidential，走当前会话代理。"""
+        kind = vm_type if vm_type in ("standard", "confidential") else "standard"
+        return await self._request(
+            "POST",
+            "/api/hatch/lease-vm",
+            sess,
+            {"vmType": kind},
         )
 
     # ---- checkout (age verification, $1 temporary authorization) ----

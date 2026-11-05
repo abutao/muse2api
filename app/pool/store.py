@@ -115,6 +115,8 @@ def _row_to_public(row: dict[str, Any], *, include_secrets: bool = False) -> dic
         ok = bool(ok)
     if not enabled:
         status = "disabled"
+    elif ok is True and row.get("assigned") == 0:
+        status = "pending_vm"
     elif ok is True:
         status = "ok"
     elif ok is False:
@@ -147,6 +149,7 @@ def _row_to_public(row: dict[str, Any], *, include_secrets: bool = False) -> dic
         "email": email,
         "enabled": enabled,
         "ok": ok,
+        "assigned": None if row.get("assigned") is None else bool(row.get("assigned")),
         "status": status,
         "note": row.get("note") or "",
         "remark": row.get("note") or "",
@@ -223,12 +226,37 @@ def list_public(*, status: str = "all", q: str = "") -> list[dict[str, Any]]:
     return items
 
 
+def pending_assign_ids(*, cooldown_sec: int = 90) -> list[str]:
+    """已注册、登录有效，但工作区还没租到的号。刚失败过的先冷却。"""
+    import datetime as _dt
+
+    now = time.time()
+    out: list[str] = []
+    for row in list_raw():
+        if row.get("assigned") != 0 or not row.get("enabled", 1):
+            continue
+        checked = str(row.get("checked_at") or "")
+        if checked and cooldown_sec > 0:
+            try:
+                raw = checked[:19].replace("T", " ")
+                ts = _dt.datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=_dt.timezone.utc
+                ).timestamp()
+                if now - ts < cooldown_sec:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        out.append(str(row["id"]))
+    return out
+
+
 def stats() -> dict[str, Any]:
     items = list_public()
     return {
         "total": len(items),
         "enabled": sum(1 for a in items if a.get("enabled")),
         "ok": sum(1 for a in items if a.get("status") == "ok"),
+        "pending_vm": sum(1 for a in items if a.get("status") == "pending_vm"),
         "invalid": sum(1 for a in items if a.get("status") == "invalid"),
         "disabled": sum(1 for a in items if a.get("status") == "disabled"),
         "with_cookie": sum(1 for a in items if a.get("has_cookie")),
@@ -292,6 +320,7 @@ def add_account(
     proxy: dict[str, Any] | None = None,
     cookies_exp: dict | None = None,
     enabled: bool = True,
+    assigned: bool | None = None,
 ) -> dict[str, Any]:
     cookies = dict(cookies or {})
     if cookie_header and not cookies:
@@ -367,6 +396,8 @@ def add_account(
                 """,
                 (aid, email_v, name_v, pwd_enc, fp_json, signup_item_id, now),
             )
+    if assigned is not None:
+        update(aid, ok=True, assigned=assigned)
     return get_public(aid) or {"id": aid}
 
 
@@ -413,6 +444,7 @@ def update(
     cookies_exp: dict | None = None,
     proxy: dict[str, Any] | None = None,
     ok: bool | None = None,
+    assigned: bool | None = None,
     quota: Any = None,
     touch_used: bool = False,
     touch_keepalive: bool = False,
@@ -436,9 +468,17 @@ def update(
         fields["note"] = note
     if enabled is not None:
         fields["enabled"] = 1 if enabled else 0
+    if assigned is not None:
+        fields["assigned"] = 1 if assigned else 0
     if ok is not None:
         fields["ok"] = 1 if ok else 0
-        fields["status"] = "ok" if ok else "invalid"
+        assigned_flag = fields.get("assigned", row.get("assigned"))
+        if not ok:
+            fields["status"] = "invalid"
+        elif assigned_flag == 0:
+            fields["status"] = "pending_vm"
+        else:
+            fields["status"] = "ok"
     if quota is not None:
         fields["quota_cache"] = json.dumps(quota, ensure_ascii=False)
     if proxy is not None:
@@ -597,6 +637,8 @@ def pick_account(
     def _usable(r: dict[str, Any]) -> bool:
         if not r.get("enabled", 1):
             return False
+        if r.get("assigned") == 0:
+            return False
         cd = r.get("cooldown_until")
         if cd and int(cd) > now:
             return False
@@ -662,12 +704,14 @@ def apply_session_renewal(
     cookies_exp: dict | None = None,
     *,
     ok: bool = True,
+    assigned: bool | None = None,
 ) -> None:
     update(
         aid,
         cookies=cookies,
         cookies_exp=cookies_exp,
         ok=ok,
+        assigned=assigned,
         touch_keepalive=True,
         checked=True,
         expires_at=account_expiry(cookies_exp or {}),  # real Cookie expires only; None if unknown

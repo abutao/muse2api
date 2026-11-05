@@ -20,7 +20,7 @@ const TITLE = {
   refills: ['补号系统', '<svg viewBox="0 0 24 24"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/><circle cx="12" cy="12" r="6"/></svg>'],
   settings: ['系统设置', '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>'],
 };
-const STATUS = { ok: '可用', cooling: '冷却中', no_quota: '额度用尽', invalid: '异常', disabled: '已停用', unknown: '未检测' };
+const STATUS = { ok: '可用', pending_vm: '已注册待分配', cooling: '冷却中', no_quota: '额度用尽', invalid: '异常', disabled: '已停用', unknown: '未检测' };
 const HTTP_LABEL = {
   400: '请求无效', 401: '未授权', 403: '拒绝访问', 404: '未找到',
   408: '上游超时', 429: '请求过频', 500: '上游错误', 502: '网关错误',
@@ -136,6 +136,44 @@ function normRecord(r) {
     api_type: r.api_type, key_prefix: r.key_prefix, source: r.source,
     upstream_task_id: r.upstream_task_id, error: r.error || '',
   });
+}
+function isChatRecord(r) {
+  if (!r) return false;
+  const t = String(r.api_type || '').toLowerCase();
+  if (t === 'chat') return true;
+  if (/\/chat\/completions/.test(String(r.path || ''))) return true;
+  return false;
+}
+function absUrl(u) {
+  try { return new URL(u, location.origin).href; } catch (_) { return u; }
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); }
+  catch (_) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); ta.remove();
+  }
+  toast('链接已复制');
+}
+async function downloadUrl(url) {
+  const name = decodeURIComponent((String(url).split('?')[0].split('/').pop()) || 'download');
+  try {
+    const r = await fetch(url, { credentials: 'include' });
+    if (!r.ok) throw new Error(String(r.status));
+    const blob = await r.blob();
+    const obj = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = obj; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(obj), 2000);
+    toast('已开始下载');
+    return;
+  } catch (_) {}
+  const a = document.createElement('a');
+  a.href = url; a.download = name; a.target = '_blank'; a.rel = 'noopener';
+  document.body.appendChild(a); a.click(); a.remove();
 }
 function normAccount(a) {
   if (!a) return a;
@@ -778,27 +816,62 @@ async function pageGenerate() {
     if (!bx) return;
     trimJobs();
     if (!jobs.length) { bx.innerHTML = '<div class="hint" style="grid-column:1/-1;text-align:center;padding:50px 0">暂无任务</div>'; return; }
-    bx.innerHTML = jobs.map(j => {
+    bx.innerHTML = jobs.map((j, i) => {
       let th;
-      if (j.state === 'run') th = '<div class="spin"></div>';
-      else if (j.urls && j.urls.length) th = isVideoUrl(j.urls[0], j) ? `<video src="${esc(j.urls[0])}" controls preload="metadata"></video>` : `<a href="${esc(j.urls[0])}" target="_blank"><img src="${esc(j.urls[0])}" /></a>`;
-      else if (j.status === 200) th = `<div>已受理<br><a href="${esc(j.href || '#')}" target="_blank">结果链接</a></div>`;
+      const waiting = j.state === 'run' || (!(j.urls && j.urls.length) && !j.error && j.status >= 200 && j.status < 400);
+      if (waiting) th = '<div class="spin"></div>';
+      else if (j.urls && j.urls.length) th = isVideoUrl(j.urls[0], j) ? `<video src="${esc(j.urls[0])}" muted preload="metadata"></video>` : `<img src="${esc(j.urls[0])}" />`;
       else th = `<div style="color:var(--err)">${esc(httpLabel(j.status))}<br>${esc(friendlyErr(j.error || '').slice(0, 110))}</div>`;
-      const ok = j.state !== 'run' && j.status === 200 && !j.error && j.urls && j.urls.length;
-      const chip = j.state === 'run' ? 'c-busy' : ok ? 'c-ok' : 'c-invalid';
-      return `<div class="job"><div class="thumb">${th}</div><div class="meta"><div class="p">${esc(j.prompt)}</div>
-        <div style="display:flex;justify-content:space-between;color:var(--muted)"><span class="mono">${jobTime(j)}</span><span class="chip ${chip}">${j.state === 'run' ? '进行中' : httpLabel(j.status, !!ok)}</span></div>
+      const ok = !waiting && j.status >= 200 && j.status < 300 && !j.error && j.urls && j.urls.length;
+      const chip = waiting ? 'c-busy' : ok ? 'c-ok' : 'c-invalid';
+      return `<div class="job" data-i="${i}" title="点击查看"><div class="thumb">${th}</div><div class="meta"><div class="p">${esc(j.prompt)}</div>
+        <div style="display:flex;justify-content:space-between;color:var(--muted)"><span class="mono">${jobTime(j)}</span><span class="chip ${chip}">${waiting ? '进行中' : httpLabel(j.status, !!ok)}</span></div>
         <div style="color:var(--muted);margin-top:3px">${esc(j.model)} · ${esc(j.desc)} · ${j.ms ? (j.ms / 1000).toFixed(1) + 's' : '...'}</div></div></div>`;
     }).join('');
+    bx.querySelectorAll('.job[data-i]').forEach(el => { el.onclick = () => openJob(jobs[+el.dataset.i]); });
+  }
+  function openJob(j) {
+    if (!j) return;
+    const urls = (j.urls && j.urls.length ? j.urls : (j.href ? [j.href] : [])).filter(Boolean);
+    const primary = urls[0] || '';
+    const media = !primary
+      ? `<div class="hint" style="color:#cbd5e1;padding:28px">${j.state === 'run' ? '还在生成…' : esc(friendlyErr(j.error || '还没有结果'))}</div>`
+      : (isVideoUrl(primary, j)
+        ? `<video src="${esc(primary)}" controls autoplay playsinline></video>`
+        : `<img src="${esc(primary)}" alt="" />`);
+    const rows = urls.map((u, i) => `<div class="media-link"><code title="${esc(absUrl(u))}">${urls.length > 1 ? (i + 1) + '. ' : ''}${esc(absUrl(u))}</code><button class="btn" data-cp="${i}">复制链接</button><button class="btn" data-dl="${i}">下载</button></div>`).join('');
+    const m = modal(`<div class="media-pop">
+      <h3>${esc(j.prompt || '任务')}</h3>
+      <div class="media-stage">${media}</div>
+      <div class="hint" style="margin:8px 0 0">${esc(j.model || '')}${j.desc ? ' · ' + esc(j.desc) : ''}</div>
+      ${rows}
+      <div class="foot"><button class="btn primary" id="cl">关闭</button></div>
+    </div>`, box => {
+      $('#cl', box).onclick = () => box.remove();
+      box.querySelectorAll('[data-cp]').forEach(b => b.onclick = () => copyText(absUrl(urls[+b.dataset.cp])));
+      box.querySelectorAll('[data-dl]').forEach(b => b.onclick = () => downloadUrl(urls[+b.dataset.dl]));
+    });
+    return m;
   }
   function recToJob(r) {
+    const urls = r.imageUrls || [];
+    const waiting = r.state === 'running' || r.running || (!urls.length && !r.error && r.status >= 200 && r.status < 400);
     return {
-      recId: r.id, prompt: r.prompt, model: r.model, desc: r.size || '',
-      state: r.state === 'running' ? 'run' : 'done', status: r.status,
-      href: r.resultHref, urls: r.imageUrls || [], kind: /seedance|veo|omni|video|vid_/.test(r.model || '') || r.api_type === 'video' ? 'video' : 'image',
+      recId: r.id, taskId: r.upstream_task_id || r.task_id || '', prompt: r.prompt, model: r.model, desc: r.size || '',
+      state: waiting ? 'run' : 'done', status: r.status,
+      href: urls[0] || '', urls, kind: r.kind || (/seedance|veo|omni|video|vid_/.test(r.model || '') || r.api_type === 'video' ? 'video' : 'image'),
       at: r.finishedAt || r.createdAt, createdAt: r.createdAt, finishedAt: r.finishedAt,
-      ms: r.elapsedMs, error: r.error, account: r.account,
+      ms: r.elapsedMs, error: waiting ? '' : r.error, account: r.account,
     };
+  }
+  function jobKey(j) {
+    return String(j.taskId || j.upstream_task_id || j.recId || '');
+  }
+  function preferJob(a, b) {
+    const am = !!(a.urls && a.urls.length), bm = !!(b.urls && b.urls.length);
+    if (am !== bm) return am ? a : b;
+    if ((a.state === 'run') !== (b.state === 'run')) return a.state === 'run' ? b : a;
+    return (a.at || 0) >= (b.at || 0) ? a : b;
   }
   async function loadGallery() {
     try {
@@ -811,24 +884,31 @@ async function pageGenerate() {
         const d = await api('/api/records?page_size=' + GALLERY_MAX, { soft: true });
         items = ((d && d.items) || []).map(normRecord);
       } else {
-        items = items.map(x => normRecord(Object.assign({}, x, {
+        items = items.filter(x => !isChatRecord(x)).map(x => normRecord(Object.assign({}, x, {
           created_at: x.created_at || x.createdAt,
           media_urls: x.media_urls || x.urls || x.imageUrls || (x.url ? [x.url] : []),
           prompt_preview: x.prompt || x.prompt_preview,
           status: x.status,
+          state: x.running ? 'running' : x.state,
+          upstream_task_id: x.upstream_task_id,
         })));
       }
-      const byId = new Map(items.map(r => [String(r.id), r]));
-      for (const j of jobs) {
-        if (j.state !== 'run' || !j.recId) continue;
-        const r = byId.get(String(j.recId));
-        if (r && r.state !== 'running') Object.assign(j, recToJob(r));
-      }
-      const live = jobs.filter(j => j.state === 'run');
-      const used = new Set(live.map(j => String(j.recId)).filter(Boolean));
-      const hist = items.map(recToJob).filter(j => !used.has(String(j.recId)));
+      items = items.filter(r => !isChatRecord(r));
+      const merged = [];
+      const seen = new Map();
+      const put = (j) => {
+        if (!j) return;
+        if (j.state !== 'run' && !(j.urls && j.urls.length) && !j.error) return;
+        const key = jobKey(j);
+        if (!key) { merged.push(j); return; }
+        if (!seen.has(key)) { seen.set(key, merged.length); merged.push(j); return; }
+        merged[seen.get(key)] = preferJob(merged[seen.get(key)], j);
+      };
+      jobs.filter(j => j.state === 'run' || (j.urls && j.urls.length) || j.error).forEach(put);
+      items.map(recToJob).forEach(put);
+      merged.sort((a, b) => (a.state === 'run') === (b.state === 'run') ? (b.at || 0) - (a.at || 0) : (a.state === 'run' ? -1 : 1));
       jobs.length = 0;
-      jobs.push(...live, ...hist);
+      jobs.push(...merged);
       render();
     } catch (_) { render(); }
   }
@@ -844,6 +924,7 @@ async function pageGenerate() {
       if (!t) continue;
       const st = String(t.status || t.state || '').toLowerCase();
       if (!st || st === 'queued' || st === 'running' || st === 'in_progress' || st === 'processing') continue;
+      if (/^(completed|succeeded|success|done)$/.test(st) && !extractJobUrls(t).length) continue;
       applyJobDone(j, Object.assign({}, t, { http_status: t.http_status || 200 }), t0);
       render();
       loadGallery();
@@ -898,6 +979,7 @@ async function pageGenerate() {
           return;
         }
         j.recId = tid;
+        j.taskId = tid;
         render();
         return watchTask(j, tid, t0, kind);
       }).catch(e => { Object.assign(j, { state: 'done', error: String(e), ms: performance.now() - t0, at: Date.now() }); render(); });
@@ -1038,7 +1120,7 @@ async function pageAccounts() {
   <div class="card">
     <div class="tools">
       <div class="l">
-        <select id="fs"><option value="all">状态：全部</option><option value="ok">可用</option><option value="unknown">未检测</option><option value="invalid">异常</option><option value="disabled">已停用</option></select>
+        <select id="fs"><option value="all">状态：全部</option><option value="ok">可用</option><option value="pending_vm">已注册待分配</option><option value="unknown">未检测</option><option value="invalid">异常</option><option value="disabled">已停用</option></select>
         <select id="so"><option value="imported">按导入时间</option><option value="used">按最近使用</option><option value="success">按成功数</option><option value="name">按名称</option></select>
         <input type="text" id="q" placeholder="搜索 邮箱 / 名称 / ID / 备注" />
       </div>
@@ -1054,7 +1136,7 @@ async function pageAccounts() {
       </div>
     </div>
     <div class="tablewrap"><table class="acc-table">
-      <thead><tr><th style="width:36px"><input type="checkbox" id="all" /></th><th>标签</th><th>账号</th><th class="hide-m">ID</th><th>状态</th><th>有效期</th><th>额度</th><th>启用</th><th>Cookie</th><th class="hide-m">最后使用</th><th class="hide-m">备注</th><th style="min-width:220px">操作</th></tr></thead>
+      <thead><tr><th style="width:36px"><input type="checkbox" id="all" /></th><th>标签</th><th>账号</th><th class="hide-m">ID</th><th>状态</th><th>有效期</th><th>额度</th><th>启用</th><th>Cookie</th><th class="hide-m">最后使用</th><th style="min-width:220px">操作</th></tr></thead>
       <tbody id="tb"></tbody></table></div>
     <div class="pager">
       <span id="info"></span>
@@ -1085,6 +1167,7 @@ async function pageAccounts() {
     $('#asum').innerHTML = [
       ['总计', total != null ? total : (a.total || 0), 'c-disabled'],
       ['可用', a.ok || a.active || a.healthy || 0, 'c-ok'],
+      ['待分配', a.pending_vm || 0, 'c-pending_vm'],
       ['使用中', a.busy || 0, 'c-busy'],
       ['冷却', a.cooling || 0, 'c-cooling'],
       ['额度用尽', a.no_quota || 0, 'c-no_quota'],
@@ -1120,7 +1203,6 @@ async function pageAccounts() {
         <td>${en}</td>
         <td>${ck}</td>
         <td class="hide-m mono" title="${a.last_used ? fmtTime(tsMs(a.last_used)) : ''}">${agoUnix(a.last_used)}</td>
-        <td class="hide-m mono ellip" title="${esc(a.note || '')}">${esc(a.note || '—')}</td>
         <td><div class="acts">
           <button class="ab" data-a="check" data-id="${a.id}" title="检测 Cookie 并刷新额度">检测</button>
           <button class="ab" data-a="quota" data-id="${a.id}" title="查询额度">额度</button>
@@ -1128,7 +1210,7 @@ async function pageAccounts() {
           <button class="ab" data-a="reset" data-id="${a.id}" title="重新检测 / 恢复">恢复</button>
           <button class="ab danger" data-a="del" data-id="${a.id}">删除</button>
         </div></td></tr>`;
-    }).join('') || '<tr><td colspan="12" style="padding:40px;color:var(--muted)">暂无账号，点击右上角「导入账号」</td></tr>';
+    }).join('') || '<tr><td colspan="11" style="padding:40px;color:var(--muted)">暂无账号，点击右上角「导入账号」</td></tr>';
     $('#info').textContent = `第 ${AS.page} / ${AS.pages} 页，共 ${AS.total} 条` + (AS.sel.size ? ` · 已选 ${AS.sel.size}` : '');
     $('#all').checked = AS.items.length > 0 && AS.items.every(a => AS.sel.has(a.id));
     document.querySelectorAll('#tb input[type=checkbox][data-id]').forEach(c => c.onchange = () => { c.checked ? AS.sel.add(c.dataset.id) : AS.sel.delete(c.dataset.id); draw(); });
@@ -1142,11 +1224,14 @@ async function pageAccounts() {
   async function rowAction(act, id) {
     const a = AS.items.find(x => x.id === id);
     try {
-      if (act === 'check') { toast('检测中…'); const r = await api(`/api/accounts/${id}/check`, { method: 'POST' }); toast(r.ok
-            ? (r.assigned === false
-                ? ('登录态有效 · ' + (r.note || '工作区未分配（等 VM）').replace(/^登录态有效，?/, ''))
-                : 'Cookie 有效，会话已续签')
-            : ('检测失败: ' + (r.error || r.message || r.status)), !r.ok); }
+      if (act === 'check') {
+        toast('检测中…');
+        const r = await api(`/api/accounts/${id}/check`, { method: 'POST' });
+        const pending = (r.note || r.message || '工作区尚未分配（等 VM 供货）').replace(/^登录态有效[，,·]?\s*/, '');
+        toast(r.ok
+          ? (r.assigned === false ? ('登录态有效 · ' + pending) : '登录有效，工作区已分配')
+          : ('检测失败: ' + (r.error || r.message || r.status)), !r.ok);
+      }
       else if (act === 'quota') { toast('查询额度…'); const r = await api(`/api/accounts/${id}/quota`, { method: 'POST' }); toast(r.found ? (`额度：${r.plan || '?'}，周用量已用 ${r.weekly_used_pct ?? '?'}%`) : ('未读到额度' + (r.error || r.message ? ': ' + (r.error || r.message) : '')), !r.found); }
       else if (act === 'toggle') await api('/api/accounts/' + id, { method: 'PATCH', body: { enabled: !a.enabled } });
       else if (act === 'reset') await api('/api/accounts/batch', { method: 'POST', body: { ids: [id], action: 'reset' } });
@@ -1245,9 +1330,20 @@ async function pageSettings() {
   const s = wrap.config || wrap;
   const num = (id, label, v, _hint = '', min = 0, max = 100000, step = 1) => `<div><label class="f">${label}</label><input type="number" id="${id}" value="${v}" min="${min}" max="${max}" step="${step}" /></div>`;
   const bool = (id, label, v, off, on) => `<div class="span2"><label class="f">${label}</label><select id="${id}"><option value="false">${off}</option><option value="true">${on}</option></select></div>`;
-  const card = (title, _sub, body) => `<div class="card"><h2><span>${title}</span></h2>${body}</div>`;
-  const left = [
-    card('生成引擎', '', `
+  const card = (title, sub, body, wide = false) => `<div class="card${wide ? ' wide' : ''}"><div class="scard-h"><h2>${title}</h2>${sub ? `<p>${sub}</p>` : ''}</div>${body}</div>`;
+  const svg = d => `<svg viewBox="0 0 24 24">${d}</svg>`;
+  const IC = {
+    engine: svg('<rect x="4" y="4" width="16" height="16" rx="2.5"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 1.5V4M15 1.5V4M9 20v2.5M15 20v2.5M1.5 9H4M1.5 15H4M20 9h2.5M20 15h2.5"/>'),
+    sched: svg('<circle cx="9" cy="8" r="3.2"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><path d="M16 4.5a3.2 3.2 0 010 6.3M18.5 14.4c1.5.9 2.5 2.6 2.5 4.6"/>'),
+    signup: svg('<circle cx="10" cy="8" r="3.5"/><path d="M3.5 20c0-3.6 2.9-6.5 6.5-6.5 1.4 0 2.6.4 3.7 1.1"/><path d="M18 14v6M15 17h6"/>'),
+    net: svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 5.7 3.8 9s-1.3 6.3-3.8 9c-2.5-2.7-3.8-5.7-3.8-9S9.5 5.7 12 3z"/>'),
+    r2: svg('<path d="M7 18a4.5 4.5 0 01-.6-9A6 6 0 0118 8.5a4.8 4.8 0 01-.5 9.5z"/><path d="M12 11v6M9.5 14.5L12 17l2.5-2.5"/>'),
+    sec: svg('<path d="M12 2.5l7.5 3v6c0 4.6-3.2 8.6-7.5 10-4.3-1.4-7.5-5.4-7.5-10v-6z"/><path d="M9 12l2.2 2.2L15.5 10"/>'),
+  };
+  const groups = [];
+  const tab = (id, label, desc, icon, cards) => groups.push({ id, label, desc, icon, cards });
+  tab('engine', '引擎与性能', '生成引擎、超时并发与媒体策略', IC.engine, [
+    card('生成引擎', '本地 CDP 浏览器引擎与对外访问地址', `
       <div class="form-grid">
         <div class="span2"><label class="f">引擎后端</label>
           <input type="text" id="engine_backend" value="local" readonly /></div>
@@ -1256,7 +1352,7 @@ async function pageSettings() {
         <div><label class="f">引擎并发</label><input type="number" id="engine_concurrency" value="${s.engine_concurrency ?? 2}" min="1" max="32" /></div>
         <div class="span2"><label class="f">本机公网地址 Public Base（改写媒体链接）</label><input type="text" id="public_base" value="${esc(s.public_base || '')}" placeholder="http://127.0.0.1:8090" /></div>
       </div>`),
-    card('超时与并发', '', `<div class="form-grid">
+    card('超时与并发', '请求生命周期与排队控制', `<div class="form-grid">
       ${num('connect_timeout_sec', '连接超时 (秒)', s.connect_timeout_sec ?? 10, '', 1, 120, 0.5)}
       ${num('request_timeout_sec', '请求超时 (秒)', s.request_timeout_sec ?? 120, '', 5, 600, 1)}
       ${num('stream_idle_timeout_sec', 'SSE 空闲超时 (秒)', s.stream_idle_timeout_sec ?? 60, '', 5, 600, 1)}
@@ -1264,22 +1360,32 @@ async function pageSettings() {
       ${num('queue_wait_sec', '排队最长等待 (秒)', s.queue_wait_sec ?? 25, '', 0, 600)}
       ${num('record_keep_days', '记录保留 (天)', s.record_keep_days ?? 30, '0 = 不自动清理', 0, 3650)}
     </div>`),
-    card('媒体与试调', '', `<div class="form-grid">
+    card('媒体与试调', '媒体链接访问、试调开关与计费口径', `<div class="form-grid two">
       ${bool('media_auth_required', '媒体链接鉴权', !!s.media_auth_required, '关闭：/v1/media 可裸链', '开启：需 Bearer')}
       ${bool('rewrite_media_urls', '改写媒体到本机', s.rewrite_media_urls !== false, '关闭：保留上游 URL', '开启：改写到 Public Base')}
       ${bool('console_generate_enabled', '管理台试调', s.console_generate_enabled !== false, '关闭：生图页不可用', '开启：发短时 Token')}
       ${bool('charge_on_upstream_error', '上游错误也扣 Key 额度', !!s.charge_on_upstream_error, '关闭：仅成功扣减', '开启：失败也计次')}
-    </div>`),
-  ];
-  const right = [
-    card('注册 / 补号默认', '', `<div class="form-grid">
+    </div>`, true),
+  ]);
+  tab('signup', '注册补号', '注册默认值、并发与每日看门狗', IC.signup, [
+    card('注册 / 补号默认', '新注册账号的地区、入池与保活', `<div class="form-grid">
       <div><label class="f">默认地区</label><input type="text" id="default_region" value="${esc(s.default_region || 'US')}" /></div>
       ${bool('default_into_pool', '成功后入池', s.default_into_pool !== false, '只保存任务', '写入本地号池')}
       ${bool('proxy_scheduled_keepalive', '定时保活', !!s.proxy_scheduled_keepalive, '关闭', '开启（本地号池 renew）')}
       <div class="span2"><label class="f">注册客户端标识 Signup Client</label><input type="text" id="signup_client" value="${esc(s.signup_client || '')}" placeholder="协议客户端标识" /></div>
       <div class="span2"><label class="f">Muse 协议基址 Signup Muse Base</label><input type="text" id="signup_muse_base" value="${esc(s.signup_muse_base || '')}" placeholder="可选覆盖" /></div>
     </div>`),
-    card('防关联 / 账号调度', '', `<div class="form-grid">
+    card('补号系统', '补号并发、间隔与每日定时补号', `<div class="form-grid">
+      ${num('signup_concurrency', '注册并发数 (1-10)', s.signup_concurrency ?? 2, '', 1, 10)}
+      ${num('signup_interval_sec', '同线程间隔 (秒)', s.signup_interval_sec ?? 30, '', 0, 600)}
+      ${bool('signup_daily_enabled', '看门狗日补', !!s.signup_daily_enabled, '关闭：只手动补号', '开启：每天定时补')}
+      ${num('signup_daily_hour', '每天几点 (0-23)', s.signup_daily_hour ?? 10, '', 0, 23)}
+      ${num('signup_daily_minute', '几分 (0-59)', s.signup_daily_minute ?? 0, '', 0, 59)}
+      ${num('signup_daily_count', '每天补几个 (0=全部待补)', s.signup_daily_count ?? 20, '', 0, 100000)}
+    </div>`),
+  ]);
+  tab('sched', '账号调度', '防关联节奏、额度与异常冷却', IC.sched, [
+    card('防关联 / 账号调度', '控制号池中每个账号的使用节奏，降低关联与风控风险', `<div class="form-grid">
       ${num('acct_min_interval_sec', '同号提交间隔 (秒)', s.acct_min_interval_sec ?? 20, '', 0, 3600)}
       ${num('acct_interval_jitter_pct', '间隔抖动 (%)', s.acct_interval_jitter_pct ?? 40, '', 0, 200)}
       ${num('acct_global_daily_cap', '全号每日上限 (0=不限)', s.acct_global_daily_cap ?? 0, '', 0, 100000)}
@@ -1289,31 +1395,43 @@ async function pageSettings() {
       ${num('acct_408_disable_streak', '连续 408 自动禁用 (次)', s.acct_408_disable_streak ?? 3, '', 0, 100)}
       ${num('acct_cooldown_cap_min', '冷却上限 (分)', s.acct_cooldown_cap_min ?? 30, '', 0, 1440)}
       ${num('acct_403_stop_hours', '403 停用 (小时)', s.acct_403_stop_hours ?? 24, '', 0, 720)}
-    </div>`),
-    card('补号系统', '', `<div class="form-grid">
-      ${num('signup_concurrency', '同时补号数', s.signup_concurrency ?? 2, '', 1, 8)}
-      ${num('signup_interval_sec', '同线程间隔 (秒)', s.signup_interval_sec ?? 30, '', 0, 600)}
-      ${bool('signup_daily_enabled', '看门狗日补', !!s.signup_daily_enabled, '关闭：只手动补号', '开启：每天定时补')}
-      ${num('signup_daily_hour', '每天几点 (0-23)', s.signup_daily_hour ?? 10, '', 0, 23)}
-      ${num('signup_daily_minute', '几分 (0-59)', s.signup_daily_minute ?? 0, '', 0, 59)}
-      ${num('signup_daily_count', '每天补几个 (0=全部待补)', s.signup_daily_count ?? 20, '', 0, 100000)}
-    </div>`),
-    card('代理与结果模式', '', `<div class="form-grid">
+    </div>`, true),
+  ]);
+  tab('net', '代理与结果', '出口代理列表与生成结果回传方式', IC.net, [
+    card('代理与结果模式', '注册与生成请求使用的出口代理，以及结果的交付方式', `<div class="form-grid">
       <div class="span2"><label class="f">代理列表（每行一个，支持 http/socks5，可含账号，支持 {sid} 占位）</label>
         <textarea id="proxies" style="min-height:110px" placeholder="us.udealproxy.com:6666:userId-7992-region-us-session-{sid}-sessTime-5:自己的密码&#10;socks5h://user:pass@host:3010&#10;支持 host:port:user:pass / user:pass@host:port / 完整 URL，{sid} 自动换会话">${esc(s.proxies || '')}</textarea>
         <div class="chips" style="margin-top:8px"><button class="btn" id="ptest">测试代理</button><span class="hint" style="margin:0" id="ptestres"></span></div></div>
       <div class="span2"><label class="f">生成结果模式 result_mode</label>
         <select id="result_mode"><option value="direct">直链 direct（默认）</option><option value="r2">R2 回传</option></select></div>
-    </div>`),
-    card('安全', '', `<div class="form-grid">
+    </div>`, true),
+  ]);
+  tab('r2', 'R2 存储', 'R2 回传模式使用的存储账号池', IC.r2, ['<div id="r2host"></div>']);
+  tab('sec', '安全与密钥', '管理员密码与对外 API Key', IC.sec, [
+    card('安全', '修改管理台登录密码与对外调用密钥', `<div class="form-grid">
       <div><label class="f">管理员用户名</label><input type="text" id="admin_user" value="${esc(s.admin_user || 'admin')}" readonly /></div>
       <div><label class="f">新密码（≥6，留空不改）</label><input type="password" id="admin_password" autocomplete="new-password" /></div>
       <div class="span2"><label class="f">确认新密码</label><input type="password" id="admin_password_confirm" autocomplete="new-password" /></div>
     
-      <div class="span2"><label class="f">API Key（外部调用 /v1/images/generate：Authorization: Bearer …）</label><div style="display:flex;gap:8px"><input type="text" id="apikey" readonly value="${esc(s.outbound_key || '')}" style="flex:1" /><button class="btn" id="kcopy" type="button">复制</button><button class="btn" id="krot" type="button">重新生成</button></div></div></div>`),
-  ];
-  $('#st').innerHTML = `<div class="cols2"><div class="col">${left.join('')}</div><div class="col">${right.join('')}</div></div>
-    <div id="r2host"></div>`;
+      <div class="span2"><label class="f">API Key（外部调用 /v1/images/generate：Authorization: Bearer …）</label><div style="display:flex;gap:8px"><input type="text" id="apikey" readonly value="${esc(s.outbound_key || '')}" style="flex:1" /><button class="btn" id="kcopy" type="button">复制</button><button class="btn" id="krot" type="button">重新生成</button></div></div></div>`, true),
+  ]);
+  $('#st').innerHTML = `<div class="stabs-layout">
+    <aside class="stabs" role="tablist">${groups.map(g => `<button class="stab" type="button" role="tab" data-tab="${g.id}">
+      <span class="ic">${g.icon}</span><span class="t"><b>${g.label}</b><small>${g.desc}</small></span></button>`).join('')}</aside>
+    <section class="stab-body">${groups.map(g => `<div class="stab-panel" role="tabpanel" data-panel="${g.id}">
+      <div class="stab-hero"><span class="ic">${g.icon}</span><div><h3>${g.label}</h3><p>${g.desc}</p></div></div>
+      <div class="stab-cards">${g.cards.join('')}</div></div>`).join('')}</section></div>`;
+  const showTab = id => {
+    if (!groups.some(g => g.id === id)) id = groups[0].id;
+    document.querySelectorAll('#st .stab').forEach(b => { const on = b.dataset.tab === id; b.classList.toggle('on', on); b.setAttribute('aria-selected', on); });
+    document.querySelectorAll('#st .stab-panel').forEach(p => p.classList.toggle('on', p.dataset.panel === id));
+    $('#tst').style.display = id === 'engine' ? '' : 'none';
+    $('#save').style.display = id === 'r2' ? 'none' : '';
+    try { localStorage.setItem('settings_tab', id); } catch (_) {}
+  };
+  document.querySelectorAll('#st .stab').forEach(b => b.onclick = () => showTab(b.dataset.tab));
+  let lastTab = ''; try { lastTab = localStorage.getItem('settings_tab') || ''; } catch (_) {}
+  showTab(lastTab);
   const rm = $('#result_mode'); if (rm) rm.value = (s.result_mode === 'r2' ? 'r2' : 'direct');
   ['media_auth_required','rewrite_media_urls','console_generate_enabled','charge_on_upstream_error','default_into_pool','proxy_scheduled_keepalive'].forEach(id => {
     const el = $('#' + id); if (el) el.value = String(!!$('#' + id.replace(/^/,'')));
@@ -1396,6 +1514,7 @@ async function pageSettings() {
     $('#ptestres').textContent = '测试中…（最多 30 秒）';
     try {
       const r = await api('/api/settings/proxy-check', { method: 'POST', body: { proxies: raw } });
+      if (!(r.results || []).length) { $('#ptestres').textContent = ''; return toast(r.hint || '未配置代理', true); }
       const rows = (r.results || []).map(x => `<tr>
         <td class="mono" style="max-width:220px;word-break:break-all">${esc(x.proxy || '-')}</td>
         <td class="mono">${esc(x.ip || '-')}</td>
@@ -1450,7 +1569,7 @@ async function pageSettings() {
       default_region: $('#default_region').value.trim(),
       default_into_pool: $('#default_into_pool').value === 'true',
       queue_wait_sec: parseInt($('#queue_wait_sec').value || '25', 10),
-      signup_concurrency: parseInt($('#signup_concurrency').value || '2', 10),
+      signup_concurrency: Math.min(10, Math.max(1, parseInt($('#signup_concurrency').value || '2', 10))),
       signup_interval_sec: parseInt($('#signup_interval_sec').value || '30', 10),
       signup_daily_enabled: $('#signup_daily_enabled').value === 'true',
       signup_daily_hour: parseInt($('#signup_daily_hour').value || '10', 10),
@@ -1667,7 +1786,7 @@ async function pageRecords() {
   $('#svsz').onclick = () => { RS.size = Math.min(200, Math.max(1, parseInt($('#sz').value || '12', 10))); localStorage.setItem('rgsize', RS.size); RS.page = 1; load(); };
   const purge = async (body, what) => {
     if (!await ask(`确定${what}？（进行中的记录不会删除）`)) return;
-    try { const r = await api('/api/records/delete', { method: 'POST', body: mapRecDelete(body) }); toast(`已删除 ${r.deleted} 条`); load(); }
+    try { const r = await api('/api/records/delete', { method: 'POST', body: mapRecDelete(Object.assign({ exclude_api_type: 'chat' }, body)) }); toast(`已删除 ${r.deleted} 条`); load(); }
     catch (e) { toast(e.message, true); }
   };
   $('#cfail').onclick = () => purge({ mode: 'failed' }, '清理全部失败记录');
@@ -1681,7 +1800,7 @@ async function pageRecords() {
       const days = parseInt($('#days', m).value || '0', 10), fo = $('#fo', m).checked;
       if (days === 0 && !fo && !await ask('确定清空全部记录？')) return;
       try {
-        let body; if (fo) body = { mode: 'failed' }; else if (days > 0) body = { mode: 'before_days', days }; else body = { mode: 'all' };
+        let body; if (fo) body = { mode: 'failed', exclude_api_type: 'chat' }; else if (days > 0) body = { mode: 'before_days', days, exclude_api_type: 'chat' }; else body = { mode: 'all', exclude_api_type: 'chat' };
         const r = await api('/api/records/delete', { method: 'POST', body }); toast(`已删除 ${r.deleted} 条`); m.remove(); load();
       } catch (e) { toast(e.message, true); }
     };
@@ -1690,7 +1809,7 @@ async function pageRecords() {
     const stMap = { ok: 'success', fail: 'failed', success: 'success', failed: 'failed', running: 'running', all: 'all' };
     const qs = new URLSearchParams({ status: stMap[RS.status] || RS.status || 'all', q: RS.q, page: RS.page, page_size: RS.size });
     let d; try { d = await api('/api/records?' + qs); } catch (_) { return; }
-    const items = (d.items || []).map(normRecord);
+    const items = (d.items || []).map(normRecord).filter(r => !isChatRecord(r));
     RS.items = items; RS.total = d.total; RS.pages = d.pages; RS.page = d.page;
     const s = d.summary || { total: d.total, ok: items.filter(x => x.status_bucket === 'success').length, fail: items.filter(x => x.status_bucket === 'failed').length, running: items.filter(x => x.status_bucket === 'running').length };
     $('#sum').innerHTML = `<span class="chip c-disabled">总计 ${s.total || d.total || 0}</span><span class="chip c-ok">成功 ${s.ok || s.success || 0}</span><span class="chip c-invalid">失败 ${s.fail || s.failed || 0}</span><span class="chip c-busy">进行中 ${s.running || 0}</span>`;
@@ -1792,8 +1911,10 @@ async function pageRecords() {
 /* ---------- 补号系统 = Muse 注册（原导号 UI） ---------- */
 const SUB_STATUS = { geo_gated: '地区受限', pending: '待注册', running: '注册中', awaiting_payment: '待外部支付', awaiting_external_payment: '待外部支付', needs_profile: '待填资料', needs_otp: '待 OTP', awaiting_otp: '待 OTP', awaiting_profile: '待填资料', awaiting_recovery_code: '待恢复码', awaiting_set_password: '待设密', awaiting_password_login: '待密码登录', activated: '已注册', pooled: '已入池', failed: '失败', ready: '就绪', stopped: '已停' };
 const SUB_CHIP = { geo_gated: 'c-invalid', pending: 'c-disabled', running: 'c-busy', awaiting_payment: 'c-cooling', awaiting_external_payment: 'c-cooling', needs_profile: 'c-cooling', needs_otp: 'c-cooling', awaiting_otp: 'c-cooling', awaiting_profile: 'c-cooling', awaiting_recovery_code: 'c-cooling', awaiting_set_password: 'c-cooling', awaiting_password_login: 'c-cooling', activated: 'c-ok', pooled: 'c-pts', failed: 'c-invalid', ready: 'c-ok', stopped: 'c-disabled' };
-const SUB_COUNTRIES = ['SG', 'JP', 'US', 'DE', 'GB', 'CA', 'AU', 'FR', 'NL', 'KR', 'TW', 'HK', 'IN', 'PH', 'ID', 'MY', 'TH', 'VN', 'BR'];
-const SS = { status: 'all', q: '', page: 1, pages: 1, total: 0, size: parseInt(localStorage.getItem('subsize') || '20', 10), items: [], sel: new Set(), sum: {}, run: {}, country: localStorage.getItem('subcountry') || 'JP', intoPool: localStorage.getItem('subpool') !== '0' };
+const SUB_COUNTRIES = ['US', 'SG', 'JP', 'DE', 'GB', 'CA', 'AU', 'FR', 'NL', 'KR', 'TW', 'HK', 'IN', 'PH', 'ID', 'MY', 'TH', 'VN', 'BR'];
+let _savedCountry = localStorage.getItem('subcountry') || 'US';
+if (_savedCountry === 'JP') { _savedCountry = 'US'; localStorage.setItem('subcountry', 'US'); }
+const SS = { status: 'all', q: '', page: 1, pages: 1, total: 0, size: parseInt(localStorage.getItem('subsize') || '20', 10), items: [], sel: new Set(), sum: {}, run: {}, country: _savedCountry, intoPool: localStorage.getItem('subpool') !== '0' };
 
 async function pageRefills() {
   const main = $('#main');
@@ -1857,7 +1978,7 @@ async function pageRefills() {
       return;
     }
     el.classList.remove('hidden');
-    el.innerHTML = `<div class="subprog-top"><b>${t.running ? '注册进行中' : '上次任务'}</b><span>${t.done} / ${t.total} · 成功 ${t.ok} · 失败 ${t.fail}${t.message && !t.running ? ' · ' + esc(t.message) : ''}${t.scheduleLabel ? ' · ' + esc(t.scheduleLabel) : ''}</span>
+    el.innerHTML = `<div class="subprog-top"><b>${t.running ? '注册进行中' : '上次任务'}</b><span>${t.done} / ${t.total} · 成功 ${t.ok} · 失败 ${t.fail}${t.hold ? ' · 未完成 ' + t.hold : ''}${t.message && !t.running ? ' · ' + esc(t.message) : ''}${t.scheduleLabel ? ' · ' + esc(t.scheduleLabel) : ''}</span>
       <span style="flex:1"></span>${t.running ? '<button class="btn danger" id="stp" style="height:26px">停止</button>' : ''}</div>
       <div class="bar"><i style="width:${t.progress || 0}%"></i></div>`;
     const st = $('#stp'); if (st) st.onclick = async () => { try { await api('/api/refills/stop', { method: 'POST' }); toast('已请求停止'); loadTask(); } catch (e) { toast(e.message, true); } };
@@ -2169,20 +2290,21 @@ async function pageRefills() {
     }
     start({ ids: [...SS.sel], action }, r => `已开始${action === 'retry' ? '重试' : '注册'} ${r.count} 个邮箱`);
   }
-  function autoDlg() {
+  async function autoDlg() {
     const pending = SS.sum.pending || 0;
+    let defConc = 2;
+    try { const w = await api('/api/settings'); defConc = (w.config || w).signup_concurrency || defConc; } catch (_) {}
     modal(`<h3>一键自动补号</h3>
       <p class="hint" style="margin:0 0 8px">自动完成：取邮件账号 → 收验证码 → 填资料 → 卡池取卡 → $1 验卡 → 设密 → 入池。</p>
       <label class="f">补号数量（0 = 全部待注册，当前待注册 ${pending} 个）</label>
       <input id="an" type="number" min="0" value="0" />
-      <label class="f">并发数（1–8；建议 1–2，太高容易被 Meta 限流）</label>
-      <input id="ac" type="number" min="1" max="8" value="${parseInt(localStorage.getItem('subcc') || '1', 10)}" />
+      <label class="f">并发数（1–10，默认取「系统设置 → 注册补号」；太高容易被 Meta 限流）</label>
+      <input id="ac" type="number" min="1" max="10" value="${defConc}" />
       <div class="foot"><button class="btn" id="cx">取消</button><button class="btn primary" id="ok">开始补号</button></div>`, m => {
       $('#cx', m).onclick = () => m.remove();
       $('#ok', m).onclick = async () => {
         const n = Math.max(0, parseInt($('#an', m).value || '0', 10));
-        const c = Math.min(8, Math.max(1, parseInt($('#ac', m).value || '1', 10)));
-        localStorage.setItem('subcc', c);
+        const c = Math.min(10, Math.max(1, parseInt($('#ac', m).value || '1', 10)));
         if (!pending && !n) { toast('没有待注册的邮箱', true); return; }
         m.remove();
         await start({ all: true, status: 'pending', action: 'activate', limit: n, concurrency: c },
@@ -2224,7 +2346,7 @@ async function pageRefills() {
       let t; try { t = await api('/api/refills/task?after=' + after); } catch (_) { return; }
       $('#lst', m).textContent = t.running ? '运行中' : '空闲'; $('#lst', m).className = 'chip ' + (t.running ? 'c-busy' : 'c-disabled');
       $('#lbar', m).style.width = (t.progress || 0) + '%';
-      $('#lmsg', m).textContent = t.total ? `${t.done} / ${t.total} · 成功 ${t.ok} · 失败 ${t.fail}${t.message ? ' · ' + t.message : ''}` : '';
+      $('#lmsg', m).textContent = t.total ? `${t.done} / ${t.total} · 成功 ${t.ok} · 失败 ${t.fail}${t.hold ? ' · 未完成 ' + t.hold : ''}${t.message ? ' · ' + t.message : ''}` : '';
       $('#lstop', m).disabled = !t.running;
       const box = $('#lbox', m);
       if (t.logs && t.logs.length) {

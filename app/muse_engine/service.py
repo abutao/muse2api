@@ -111,8 +111,13 @@ def _renew_if_needed(acc: dict[str, Any]) -> tuple[dict[str, str], dict]:
     new_cookies = result.get("cookies") or cookies
     new_exp = result.get("cookies_exp") or result.get("expires") or expires
     pool_store.apply_session_renewal(
-        str(acc["id"]), new_cookies, new_exp, ok=True
+        str(acc["id"]), new_cookies, new_exp, ok=True,
+        assigned=bool(result.get("assigned")),
     )
+    if not result.get("assigned"):
+        raise MuseGenerationError(
+            result.get("message") or "登录态有效，但工作区尚未分配（等 VM 供货）"
+        )
     return new_cookies, new_exp
 
 
@@ -327,27 +332,93 @@ def local_models() -> dict[str, Any]:
     return {"object": "list", "data": models}
 
 
+def _proxy_server_for(aid: str) -> str:
+    """账号自己的出口；没有就从系统代理里抽一条新 SID。直连会被地区门挡住。"""
+    proxy = pool_store.get_proxy(aid) or {}
+    server = str(proxy.get("server") or "").strip()
+    if server:
+        return server
+    from app.config import get_settings
+    from app.signup.protocol import pick_proxy
+
+    return pick_proxy(getattr(get_settings(), "proxies", "") or "") or ""
+
+
+def _lease_workspace(aid: str, server: str) -> None:
+    """用注册同一套协议租 standard 工作区。在独立线程里跑，避免挡住正在运行的事件循环。"""
+
+    async def _run() -> None:
+        from app.signup.protocol import HttpMuseClient, MuseSession
+
+        cookies, _expires = pool_store.get_cookies(aid)
+        row = pool_store.get(aid) or {}
+        fp: dict[str, Any] = {}
+        raw = row.get("fingerprint_json")
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    fp = parsed
+            except json.JSONDecodeError:
+                fp = {}
+        sess = MuseSession(
+            cookies=dict(cookies),
+            fingerprint=fp,
+            proxy_url=server,
+            email=str(row.get("email") or ""),
+        )
+        sess.hatch_sess = cookies.get("hatch_sess") or ""
+        client = HttpMuseClient("https://muse.ai", proxy=server or None)
+        await client.lease_vm(sess)
+        if sess.cookies.get("hatch_sess"):
+            pool_store.update(aid, cookies=dict(sess.cookies))
+
+    def _worker() -> None:
+        asyncio.run(_run())
+
+    err: dict[str, BaseException] = {}
+
+    def _thread() -> None:
+        try:
+            _worker()
+        except BaseException as exc:  # noqa: BLE001
+            err["e"] = exc
+
+    th = threading.Thread(target=_thread, daemon=True)
+    th.start()
+    th.join()
+    if "e" in err:
+        raise err["e"]
+
+
 def test_account_session(aid: str) -> dict[str, Any]:
     cookies, expires = pool_store.get_cookies(aid)
     if not cookies.get("hatch_sess"):
         pool_store.update(aid, ok=False, checked=True)
         return {"ok": False, "error": "missing_hatch_sess"}
-    row = pool_store.get(aid) or {}
-    proxy = None
-    if row.get("proxy_json"):
-        try:
-            proxy = json.loads(row["proxy_json"])
-        except json.JSONDecodeError:
-            proxy = None
+    server = _proxy_server_for(aid)
+    proxy = {"server": server} if server else None
     try:
         result = MuseEngine.renew_session_http(
             cookies, expires, wake_vm=True, proxy=proxy, require_assigned=False
         )
+        if not result.get("assigned") and server:
+            try:
+                _lease_workspace(aid, server)
+                cookies, expires = pool_store.get_cookies(aid)
+                result = MuseEngine.renew_session_http(
+                    cookies, expires, wake_vm=True, proxy=proxy
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("lease workspace %s failed: %s", aid, exc)
+        if server and not (pool_store.get_proxy(aid) or {}).get("server"):
+            pool_store.update(aid, proxy={"server": server})
         pool_store.apply_session_renewal(
             aid,
             result.get("cookies") or cookies,
             result.get("cookies_exp") or result.get("expires") or expires,
             ok=True,
+            assigned=bool(result.get("assigned")),
         )
         assigned = bool(result.get("assigned"))
         if not assigned:
@@ -390,9 +461,10 @@ def test_account_session(aid: str) -> dict[str, Any]:
         return {
             "ok": True,
             "assigned": assigned,
-            "status": result.get("status"),
+            "status": result.get("status") or "none",
             "vm_state": result.get("vm_state"),
-            "note": note,
+            "message": result.get("message") or note,
+            "note": note or result.get("message") or "",
         }
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
@@ -520,6 +592,7 @@ def keepalive_account(aid: str) -> dict[str, Any]:
         result.get("cookies") or cookies,
         result.get("cookies_exp") or expires,
         ok=True,
+        assigned=bool(result.get("assigned")),
     )
     try:
         pool_store.update(aid, assigned=bool(result.get("assigned")))
@@ -529,6 +602,7 @@ def keepalive_account(aid: str) -> dict[str, Any]:
         "ok": True,
         "assigned": bool(result.get("assigned")),
         "status": result.get("status"),
+        "message": result.get("message") or "",
         "vm_state": result.get("vm_state"),
         "refreshed": result.get("refreshed"),
         "relogged": relogged,
@@ -553,7 +627,13 @@ def quota(aid: str) -> dict[str, Any]:
         )
         cookies = renewed.get("cookies") or cookies
         expires = renewed.get("cookies_exp") or renewed.get("expires") or expires
-        pool_store.apply_session_renewal(aid, cookies, expires, ok=True)
+        pool_store.apply_session_renewal(
+            aid, cookies, expires, ok=True, assigned=bool(renewed.get("assigned"))
+        )
+        if not renewed.get("assigned"):
+            raise MuseGenerationError(
+                renewed.get("message") or "登录态有效，但工作区尚未分配（等 VM 供货）"
+            )
     except MuseAuthError:
         pool_store.update(aid, ok=False, checked=True)
         raise
@@ -808,21 +888,25 @@ def queue_image_task(
                 reference_images=reference_images,
                 on_progress=lambda p: task_store.update_task(tid, progress=p),
             )
+            done_url = media_url(res["filename"])
             task_store.update_task(
                 tid,
                 status="completed",
                 progress=100,
                 account=acc_id,
                 elapsed=round(time.time() - timing["t0"], 1),
-                url=media_url(res["filename"]),
+                url=done_url,
                 log=res.get("_engine_log"),
                 attempts=res.get("_engine_attempts"),
                 result={
                     **{k: res[k] for k in ("filename", "size", "kind") if k in res},
-                    "url": media_url(res["filename"]),
+                    "url": done_url,
                     "path": res.get("path"),
                 },
             )
+            from app.call_log import finish_task_log
+
+            finish_task_log(tid, media_urls=[done_url], status=200)
         except Exception as exc:  # noqa: BLE001
             task_store.update_task(
                 tid,
@@ -830,6 +914,9 @@ def queue_image_task(
                 error=str(exc),
                 elapsed=round(time.time() - timing["t0"], 1),
             )
+            from app.call_log import finish_task_log
+
+            finish_task_log(tid, status=502, error=str(exc))
 
     threading.Thread(target=worker, daemon=True).start()
     return JSONResponse(
@@ -890,6 +977,9 @@ def queue_video_task(
                     "path": res.get("path"),
                 },
             )
+            from app.call_log import finish_task_log
+
+            finish_task_log(tid, media_urls=[vurl], status=200)
         except Exception as exc:  # noqa: BLE001
             task_store.update_task(
                 tid,
@@ -897,6 +987,9 @@ def queue_video_task(
                 elapsed=round(time.time() - timing["t0"], 1),
                 error=str(exc),
             )
+            from app.call_log import finish_task_log
+
+            finish_task_log(tid, status=502, error=str(exc))
 
     threading.Thread(target=worker, daemon=True).start()
     return {

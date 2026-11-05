@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from typing import Any
@@ -16,6 +17,17 @@ _logs: dict[str, list[dict[str, Any]]] = {}
 _lock = asyncio.Lock()
 _runner: asyncio.Task | None = None
 _sched: asyncio.Task | None = None
+_stop = False
+
+
+def request_stop() -> dict[str, Any]:
+    """Ask the running keepalive job to finish after the current account."""
+    global _stop
+    _stop = True
+    for job in _jobs.values():
+        if job.get("status") == "running":
+            job["status"] = "stopping"
+    return {"ok": True, "stopping": True}
 
 
 def get_job(job_id: str) -> dict[str, Any] | None:
@@ -88,6 +100,8 @@ def _targets(scope: str, account_ids: list[str]) -> list[str]:
 
 
 async def _run(job_id: str) -> None:
+    global _stop
+    _stop = False
     job = _jobs[job_id]
     job["status"] = "running"
     try:
@@ -96,6 +110,10 @@ async def _run(job_id: str) -> None:
         job["total"] = len(ids)
         _append(job_id, "info", f"local {action}: {len(ids)} account(s)")
         for aid in ids:
+            if _stop:
+                job["status"] = "stopped"
+                _append(job_id, "warn", "已停止")
+                return
             try:
                 result = await asyncio.to_thread(_run_one_local, action, aid)
                 if result.get("ok"):
@@ -217,10 +235,65 @@ async def scheduled_loop() -> None:
             pass
 
 
+_assign_task: asyncio.Task | None = None
+_assign_loop: asyncio.Task | None = None
+_assign_lock = asyncio.Lock()
+_log = logging.getLogger("muse-proxy.keepalive")
+
+
+async def assign_pending_once(cooldown_sec: int = 90) -> int:
+    """给「已注册待分配」的号自动租工作区。失败的过冷却后再试。"""
+    async with _assign_lock:
+        ids = pool_store.pending_assign_ids(cooldown_sec=cooldown_sec)
+        done = 0
+        for aid in ids:
+            try:
+                result = await asyncio.to_thread(engine.test_account_session, aid)
+                done += 1
+                if result.get("assigned"):
+                    _log.info("auto lease %s -> assigned", aid)
+                else:
+                    _log.info(
+                        "auto lease %s still pending: %s",
+                        aid,
+                        result.get("message") or result.get("error") or "",
+                    )
+            except Exception:  # noqa: BLE001
+                _log.exception("auto lease %s failed", aid)
+            await asyncio.sleep(0.4)
+        return done
+
+
+def kick_assign() -> None:
+    """入池时立刻补一次分配，不必干等轮询。"""
+    global _assign_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _assign_task is not None and not _assign_task.done():
+        return
+    _assign_task = loop.create_task(assign_pending_once())
+
+
+async def _assign_forever() -> None:
+    await asyncio.sleep(2)
+    first = True
+    while True:
+        try:
+            await assign_pending_once(0 if first else 90)
+            first = False
+        except Exception:  # noqa: BLE001
+            _log.exception("assign loop failed")
+        await asyncio.sleep(25)
+
+
 def ensure_scheduler() -> None:
-    global _sched
+    global _sched, _assign_loop
     if _sched is None or _sched.done():
         _sched = asyncio.create_task(scheduled_loop())
+    if _assign_loop is None or _assign_loop.done():
+        _assign_loop = asyncio.create_task(_assign_forever())
 
 def latest_job() -> dict[str, Any] | None:
     """Most recent keepalive job row (UI progress helper)."""

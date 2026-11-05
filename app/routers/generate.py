@@ -64,6 +64,46 @@ async def generate_models(request: Request):
     return {"ok": True, "object": "list", "data": body.get("data") or []}
 
 
+def _fresh_log(created_at: Any, seconds: int = 20 * 60) -> bool:
+    if not created_at:
+        return False
+    try:
+        from datetime import datetime, timezone
+
+        created = datetime.strptime(str(created_at), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created).total_seconds() < seconds
+    except Exception:
+        return False
+
+
+def _stored_media(raw: Any) -> list[str]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [u.strip() for u in parsed if isinstance(u, str) and u.strip()]
+
+
+def _task_media(task_id: str) -> tuple[list[str], str, str]:
+    if not task_id:
+        return [], "", ""
+    try:
+        from app.muse_engine import tasks as task_store
+
+        task = task_store.get_task(task_id) or {}
+    except Exception:
+        return [], "", ""
+    url = task.get("url")
+    if not url and isinstance(task.get("result"), dict):
+        url = task["result"].get("url")
+    urls = [url.strip()] if isinstance(url, str) and url.strip() else []
+    return urls, str(task.get("status") or ""), str(task.get("error") or "")
+
+
 def _media_name_from_url(url: str) -> str | None:
     try:
         path = urlparse(url).path
@@ -91,124 +131,79 @@ async def generate_gallery(request: Request, limit: int = 18):
             detail={"error": "console_disabled", "message": "试调已关闭"},
         )
     lim = max(1, min(int(limit or 18), 48))
-    items: list[dict[str, Any]] = []
     with get_db() as conn:
         rows = conn.execute(
             """
             SELECT id, created_at, path, api_type, model, status, media_urls, source,
-                   prompt_preview, upstream_task_id, method
+                   prompt_preview, upstream_task_id, method, error
             FROM call_logs
-            WHERE status IS NOT NULL AND status >= 200 AND status < 300
-              AND media_urls IS NOT NULL AND media_urls != '' AND media_urls != '[]'
+            WHERE api_type IN ('image', 'video')
+              AND ifnull(path,'') NOT LIKE '%/chat/completions%'
+              AND UPPER(ifnull(method,'POST')) = 'POST'
             ORDER BY id DESC
             LIMIT ?
             """,
             (lim * 4,),
         ).fetchall()
-        failed_rows = conn.execute(
-            """
-            SELECT id, created_at, path, api_type, model, status, media_urls, source,
-                   prompt_preview, upstream_task_id, method, error
-            FROM call_logs
-            WHERE status IS NOT NULL AND status >= 400
-              AND api_type IN ('image', 'video')
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (lim,),
-        ).fetchall()
-        prompt_by_task: dict[str, str] = {}
-        need_prompts = {
-            (r["upstream_task_id"] or "")
-            for r in rows
-            if r["upstream_task_id"] and not (r["prompt_preview"] or "").strip()
-        }
-        need_prompts.discard("")
-        if need_prompts:
-            qmarks = ",".join("?" for _ in need_prompts)
-            for pr in conn.execute(
-                f"""
-                SELECT upstream_task_id, prompt_preview FROM call_logs
-                WHERE upstream_task_id IN ({qmarks})
-                  AND prompt_preview IS NOT NULL AND prompt_preview != ''
-                ORDER BY id ASC
-                """,
-                tuple(need_prompts),
-            ).fetchall():
-                tid = pr["upstream_task_id"]
-                if tid and tid not in prompt_by_task:
-                    prompt_by_task[tid] = pr["prompt_preview"]
-    seen: set[str] = set()
-    for row in failed_rows:
-        if len(items) >= lim:
-            break
-        items.append(
-            {
-                "id": row["id"],
-                "created_at": row["created_at"],
-                "path": row["path"],
-                "api_type": row["api_type"],
-                "model": row["model"],
-                "source": row["source"],
-                "status": row["status"],
-                "prompt": (row["prompt_preview"] or "").strip(),
-                "prompt_preview": (row["prompt_preview"] or "").strip(),
-                "upstream_task_id": row["upstream_task_id"],
-                "method": row["method"],
-                "url": None,
-                "media_urls": [],
-                "media_name": None,
-                "kind": "video" if row["api_type"] == "video" else "image",
-                "error": (row["error"] or "生成失败")[:400],
-            }
-        )
+    grouped: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     for row in rows:
-        try:
-            urls = json.loads(row["media_urls"] or "[]")
-        except Exception:
-            continue
-        if not isinstance(urls, list):
-            continue
-        clean = [u for u in urls if isinstance(u, str) and u.strip()]
-        if not clean:
-            continue
-        # Prefer create(POST) rows after backfill; still accept GET poll rows
-        names = []
-        for u in clean:
-            name = _media_name_from_url(u)
-            if not name or name in seen:
-                continue
-            names.append((name, u))
-        if not names:
-            continue
-        for name, u in names:
-            seen.add(name)
-        kind = "video" if any(n.endswith(".mp4") for n, _ in names) else "image"
-        tid = row["upstream_task_id"]
-        prompt = (row["prompt_preview"] or "").strip() or (
-            prompt_by_task.get(tid or "") if tid else ""
+        tid = (row["upstream_task_id"] or "").strip()
+        key = "task:" + tid if tid else "log:" + str(row["id"])
+        urls = _stored_media(row["media_urls"])
+        task_urls, task_status, task_error = _task_media(tid)
+        if task_urls and not urls:
+            urls = task_urls
+            try:
+                from app.call_log import finish_task_log
+
+                finish_task_log(tid, media_urls=urls, status=200)
+            except Exception:
+                pass
+        status = row["status"]
+        error = (row["error"] or task_error or "")[:400]
+        failed = task_status == "failed" or (status is not None and int(status) >= 400)
+        fresh = _fresh_log(row["created_at"])
+        running = (not urls) and (not failed) and (
+            task_status in ("queued", "processing", "running", "in_progress")
+            or (not task_status and fresh and status in (200, 202, None))
         )
-        items.append(
-            {
-                "id": row["id"],
-                "created_at": row["created_at"],
-                "path": row["path"],
-                "api_type": row["api_type"],
-                "model": row["model"],
-                "source": row["source"],
-                "status": row["status"],
-                "prompt": prompt,
-                "prompt_preview": prompt,
-                "upstream_task_id": tid,
-                "method": row["method"],
-                "url": names[0][1],
-                "media_urls": [u for _, u in names],
-                "media_name": names[0][0],
-                "kind": kind,
-            }
-        )
-        if len(items) >= lim:
-            break
+        kind = "video" if row["api_type"] == "video" or any(
+            u.lower().split("?", 1)[0].endswith((".mp4", ".webm", ".mov")) for u in urls
+        ) else "image"
+        item = {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "path": row["path"],
+            "api_type": row["api_type"],
+            "model": row["model"],
+            "source": row["source"],
+            "status": 200 if urls else (502 if failed else (status or 202)),
+            "prompt": (row["prompt_preview"] or "").strip(),
+            "prompt_preview": (row["prompt_preview"] or "").strip(),
+            "upstream_task_id": tid or None,
+            "method": row["method"],
+            "url": urls[0] if urls else None,
+            "media_urls": urls,
+            "media_name": _media_name_from_url(urls[0]) if urls else None,
+            "kind": kind,
+            "running": running,
+            "error": (error or "生成失败") if failed else "",
+        }
+        prev = grouped.get(key)
+        if prev is None:
+            grouped[key] = item
+            order.append(key)
+            continue
+        # 同一个任务只留一条：有结果的盖过「已受理」
+        if item["media_urls"] and not prev["media_urls"]:
+            grouped[key] = item
+    items = [
+        grouped[k]
+        for k in order
+        if grouped[k]["media_urls"] or grouped[k]["running"] or grouped[k]["error"]
+    ]
+    items = items[:lim]
     return {"ok": True, "items": items, "count": len(items)}
 
 

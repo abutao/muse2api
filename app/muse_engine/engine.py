@@ -576,35 +576,86 @@ class MuseEngine:
                 raise MuseGenerationError("/api/session HTTP 200 返回非 JSON；会话状态未确认") from None
             if not isinstance(sj, dict):
                 raise MuseGenerationError("/api/session HTTP 200 返回非对象 JSON")
-            if sj.get("status") != "assigned" and require_assigned:
+
+            def _take_cookies(resp) -> None:
+                for c in resp.cookies:
+                    if c.value:
+                        cur_cookies[c.name] = c.value
+                    if c.expires:
+                        cur_exp[c.name] = int(float(c.expires))
+                try:
+                    import re as _re
+
+                    _now = time.time()
+                    for _raw in resp.headers.get_list("set-cookie") or []:
+                        _part = _raw.split(";", 1)[0]
+                        if "=" not in _part:
+                            continue
+                        _name, _val = _part.split("=", 1)
+                        _name = _name.strip()
+                        _val = _val.strip()
+                        if not _name or not _val:
+                            continue
+                        cur_cookies[_name] = _val
+                        _m = _re.search(r"max-age=(\d+)", _raw, _re.I)
+                        if _m:
+                            cur_exp[_name] = int(_now) + int(_m.group(1))
+                except Exception:
+                    pass
+
+            _take_cookies(r)
+            assigned = sj.get("status") == "assigned"
+            if not assigned:
+                # 新号 status=none、没有 vm。先租 standard 工作区，再续签一次。
+                try:
+                    headers["Cookie"] = "; ".join(
+                        f"{k}={v}" for k, v in cur_cookies.items() if v
+                    )
+                    headers["Content-Type"] = "application/json"
+                    leased = requests.post(
+                        "https://muse.ai/api/hatch/lease-vm",
+                        headers=headers,
+                        json={"vmType": "standard"},
+                        timeout=20,
+                        allow_redirects=False,
+                        **proxy_options,
+                    )
+                    if proxy and leased.status_code == 407:
+                        raise MuseProxyError("账号代理认证失败 (HTTP 407)，未完成工作区租用")
+                    if leased.status_code == 401:
+                        raise MuseAuthError("会话认证失败 (/api/hatch/lease-vm HTTP 401)，请在官网确认登录后重新导入 cookie")
+                    _take_cookies(leased)
+                    if leased.status_code == 200:
+                        headers["Cookie"] = "; ".join(
+                            f"{k}={v}" for k, v in cur_cookies.items() if v
+                        )
+                        again = requests.get(
+                            "https://muse.ai/api/session?vm_state=live",
+                            headers=headers,
+                            timeout=12,
+                            allow_redirects=False,
+                            **proxy_options,
+                        )
+                        if again.status_code == 401:
+                            raise MuseAuthError("会话认证失败 (/api/session HTTP 401)，请在官网确认登录后重新导入 cookie")
+                        if again.status_code == 200:
+                            try:
+                                sj2 = again.json()
+                            except ValueError:
+                                sj2 = None
+                            if isinstance(sj2, dict):
+                                sj = sj2
+                                r = again
+                                _take_cookies(again)
+                                assigned = sj.get("status") == "assigned"
+                except (MuseAuthError, MuseProxyError):
+                    raise
+                except requests.RequestException:
+                    pass
+            if not assigned and require_assigned:
                 raise MuseGenerationError(
                     "/api/session HTTP 200 未返回 assigned 会话；请在官网检查账号/工作区状态"
                 )
-            for c in r.cookies:
-                if c.value:
-                    cur_cookies[c.name] = c.value
-                if c.expires:
-                    cur_exp[c.name] = int(float(c.expires))
-            # requests 不保证把每个 Set-Cookie 都放进 jar，这里再手工解析一遍
-            try:
-                import re as _re
-
-                _now = time.time()
-                for _raw in r.headers.get_list("set-cookie") or []:
-                    _part = _raw.split(";", 1)[0]
-                    if "=" not in _part:
-                        continue
-                    _name, _val = _part.split("=", 1)
-                    _name = _name.strip()
-                    _val = _val.strip()
-                    if not _name or not _val:
-                        continue
-                    cur_cookies[_name] = _val
-                    _m = _re.search(r"max-age=(\d+)", _raw, _re.I)
-                    if _m:
-                        cur_exp[_name] = int(_now) + int(_m.group(1))
-            except Exception:
-                pass
             vm_id = sj.get("vm_id")
             assigned = sj.get("status") == "assigned"
             if not assigned and not require_assigned and wake_vm:
@@ -612,7 +663,7 @@ class MuseEngine:
             vm_state = sj.get("vm_state")
             wake_ok = False
             wake_requested = False
-            if wake_vm and vm_id and vm_state != "DISABLED":
+            if wake_vm and assigned and vm_id and vm_state != "DISABLED":
                 try:
                     headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cur_cookies.items() if v)
                     rw = requests.post("https://muse.ai/api/hatch/vm/wake", headers=headers, json={
@@ -644,10 +695,11 @@ class MuseEngine:
                     pass
             refreshed = (r.headers.get("x-hatch-session-refreshed") or "").strip() == "1"
             return {
-                "ok": True if not require_assigned else sj.get("status") == "assigned",
-                "assigned": sj.get("status") == "assigned",
+                "ok": True if not require_assigned else assigned,
+                "assigned": assigned,
                 "refreshed": refreshed,
                 "status": sj.get("status"),
+                "message": "" if assigned else "登录态有效，但工作区尚未分配（等 VM 供货）",
                 "vm_id": vm_id,
                 "vm_state": vm_state,
                 "wake_ok": wake_ok,

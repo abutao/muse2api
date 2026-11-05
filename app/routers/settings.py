@@ -101,7 +101,7 @@ class SettingsPatch(BaseModel):
     default_region: str | None = None
     default_into_pool: bool | None = None
     queue_wait_sec: int | None = None
-    signup_concurrency: int | None = None
+    signup_concurrency: int | None = Field(default=None, ge=1, le=10)
     signup_interval_sec: int | None = None
     signup_daily_enabled: bool | None = None
     signup_daily_hour: int | None = None
@@ -212,7 +212,9 @@ async def proxy_check(request: Request):
     except Exception:
         raw = ""
     source = raw if raw else (settings.proxies or "")
-    pool = [""] + [expand_proxy_sid(p) for p in parse_proxy_list(source)]
+    pool = [expand_proxy_sid(p) for p in parse_proxy_list(source)]
+    if not pool:
+        return {"ok": True, "results": [], "hint": "未配置代理，请先在代理列表中填写"}
     results: list[dict[str, Any]] = []
     fields = "status,country,countryCode,regionName,city,isp,org,proxy,hosting,query"
     for raw in pool[:30]:
