@@ -227,13 +227,19 @@ def list_public(*, status: str = "all", q: str = "") -> list[dict[str, Any]]:
 
 
 def pending_assign_ids(*, cooldown_sec: int = 90) -> list[str]:
-    """已注册、登录有效，但工作区还没租到的号。刚失败过的先冷却。"""
+    """未检测，以及已注册但工作区还没租到的号。刚失败过的先冷却。"""
     import datetime as _dt
 
     now = time.time()
     out: list[str] = []
     for row in list_raw():
-        if row.get("assigned") != 0 or not row.get("enabled", 1):
+        if not row.get("enabled", 1):
+            continue
+        ok = row.get("ok")
+        assigned = row.get("assigned")
+        unchecked = ok is None
+        waiting_vm = ok in (1, True) and assigned in (0, False)
+        if not unchecked and not waiting_vm:
             continue
         checked = str(row.get("checked_at") or "")
         if checked and cooldown_sec > 0:

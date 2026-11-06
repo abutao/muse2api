@@ -19,7 +19,7 @@ from typing import Any
 
 from app import pool_meta
 from app.pool import store as pool_store
-from app.signup import store
+from app.signup import invites, store
 from app.signup.identity import (
     ensure_profile_identity,
     password_preview,
@@ -133,6 +133,145 @@ def _bind_session_proxy(item: dict[str, Any], sess: MuseSession) -> str:
         chosen = expand_proxy_sid(pick_proxy(pool_raw, preferred=preferred) or "")
     sess.proxy_url = chosen or ""
     return mask_proxy_url(sess.proxy_url) or "(direct)"
+
+
+def _mask_code(code: str) -> str:
+    raw = (code or "").strip().upper()
+    if len(raw) <= 2:
+        return raw or "—"
+    return raw[:2] + "···"
+
+
+async def _pull_owner_code(client: Any, sess: MuseSession) -> dict[str, Any] | None:
+    """GET the account's invite, and create one when the panel has none yet."""
+    data = await client.invite_get(sess)
+    if invites.parse_invite_payload(data):
+        return data if isinstance(data, dict) else None
+    created = await client.invite_create(sess)
+    return created if isinstance(created, dict) else None
+
+
+async def _stock_session_invite(
+    item_id: str,
+    sess: MuseSession,
+    client: Any,
+    *,
+    owner_email: str,
+    owner_ref: str,
+) -> str | None:
+    try:
+        data = await _pull_owner_code(client, sess)
+    except MuseProtocolError as exc:
+        _log(item_id, f"邀请码没放进库: {exc.status_code} {exc.message}"[:180], "warn")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        _log(item_id, f"邀请码没放进库: {exc}"[:180], "warn")
+        return None
+    code = invites.remember(data, owner_email=owner_email, owner_ref=owner_ref)
+    if not code:
+        _log(item_id, "这个号还没有自己的邀请码", "warn")
+        return None
+    parsed = invites.parse_invite_payload(data) or {}
+    _log(
+        item_id,
+        f"邀请码已入库 {_mask_code(code)}，还能带 {parsed.get('uses_remaining', '?')} 个新号",
+    )
+    return code
+
+
+def _donor_session(donor: dict[str, str]) -> MuseSession | None:
+    if donor.get("kind") == "item":
+        item = store.get_item(donor["id"]) or {}
+        sess = _sess_from_meta(store.get_session_meta(donor["id"]))
+        if not sess.hatch_sess:
+            blob = item.get("cookie_blob") or ""
+            _restore_sess_cookie(item, sess)
+            if not sess.hatch_sess and blob:
+                _restore_sess_cookie({"cookie_blob": blob}, sess)
+        if not sess.csrf_token:
+            sess.csrf_token = invites.csrf_from_cookies(sess.cookies)
+        if not sess.hatch_sess or not sess.csrf_token:
+            return None
+        _bind_session_proxy(item, sess)
+        return sess
+    cookies, _exp = pool_store.get_cookies(donor["id"])
+    if not cookies.get("hatch_sess"):
+        return None
+    sess = MuseSession(
+        email=donor.get("email") or "",
+        cookies=dict(cookies),
+        hatch_sess=str(cookies.get("hatch_sess") or ""),
+        csrf_token=invites.csrf_from_cookies(cookies),
+    )
+    if not sess.csrf_token:
+        return None
+    _bind_session_proxy({}, sess)
+    return sess
+
+
+async def _ensure_invite_stock(item_id: str, exclude_email: str) -> None:
+    """Pull one invite code from every successful account that is not stocked yet."""
+    missing = invites.missing_donors(exclude_email)
+    if not missing:
+        return
+    _log(item_id, f"还有 {len(missing)} 个成功号的邀请码没入库，开始收")
+    for donor in missing:
+        sess = _donor_session(donor)
+        if sess is None:
+            _log(item_id, "有个成功号没有可用会话，这张码先跳过", "warn")
+            continue
+        client = get_muse_client(proxy=sess.proxy_url or None)
+        owner_ref = donor.get("signup_item_id") or donor.get("id") or ""
+        await _stock_session_invite(
+            item_id,
+            sess,
+            client,
+            owner_email=donor.get("email") or sess.email or "",
+            owner_ref=owner_ref,
+        )
+
+
+async def _redeem_library_invite(item_id: str, sess: MuseSession, client: Any) -> bool:
+    """Admit this new account with a code owned by an earlier success."""
+    if (sess.checkout or {}).get("invite_redeemed"):
+        return True
+    email = sess.email or ""
+    await _ensure_invite_stock(item_id, email)
+    for _nth in range(3):
+        code = invites.claim(email)
+        if not code:
+            _log(item_id, "没有可用的邀请码，这位先按原路继续", "warn")
+            return False
+        try:
+            data = await client.invite_redeem(sess, code)
+        except MuseProtocolError as exc:
+            kind = invites.classify_redeem_error(exc.status_code, exc.message, exc.detail)
+            if kind == "already":
+                invites.release(code)
+                sess.checkout = dict(sess.checkout or {})
+                sess.checkout["invite_redeemed"] = True
+                _log(item_id, "这个号已经用过邀请码")
+                return True
+            if kind == "dead":
+                invites.burn(code)
+                _log(item_id, f"邀请码 {_mask_code(code)} 失效了，换下一张", "warn")
+                continue
+            invites.release(code)
+            _log(item_id, f"邀请码没兑成: {exc.status_code} {exc.message}"[:180], "warn")
+            return False
+        sess.checkout = dict(sess.checkout or {})
+        sess.checkout["invite_redeemed"] = True
+        admitted = ""
+        if isinstance(data, dict):
+            admitted = str(data.get("waitlistStatus") or data.get("waitlist_status") or "")
+        _log(
+            item_id,
+            f"用老号的邀请码 {_mask_code(code)} 带入"
+            + (f" · {admitted}" if admitted else ""),
+        )
+        return True
+    _log(item_id, "连续几张邀请码都没兑上", "warn")
+    return False
 
 
 def _format_protocol_error(exc: MuseProtocolError) -> str:
@@ -481,11 +620,25 @@ async def _after_session(
         _log(item_id, "到达 awaiting_external_payment（checkout 已关闭）")
         return {"ok": True, "status": "awaiting_external_payment", "needs": ["payment_external"]}
 
-    # fallback: no card needed → TOS → wake → 设密 → 入池
-    try:
-        await client.accept_tos(sess)
-        _log(item_id, "accept-tos OK（该账号无需卡验证）")
-    except MuseProtocolError as exc:
+    # fallback: checkout refused this account (usually not admitted yet).
+    # Spend one code from a successful account, then accept the terms.
+    tos_ok = False
+    last_exc: MuseProtocolError | None = None
+    for attempt in (1, 2):
+        if attempt == 2 and (sess.checkout or {}).get("invite_redeemed"):
+            break
+        await _redeem_library_invite(item_id, sess, client)
+        try:
+            await client.accept_tos(sess)
+            _log(item_id, "accept-tos OK（该账号无需卡验证）")
+            tos_ok = True
+            break
+        except MuseProtocolError as exc:
+            last_exc = exc
+            if (sess.checkout or {}).get("invite_redeemed"):
+                break
+    if not tos_ok:
+        exc = last_exc or MuseProtocolError(403, "accept_tos_failed", {})
         det = exc.detail if isinstance(exc.detail, dict) else {}
         msg = (
             "checkout 不可用且 accept-tos 被拒：出口 IP 未放行 or 需要邀请码 "
@@ -631,6 +784,9 @@ async def _finish_activation(
         item_id,
         f"注册成功：已获取 Cookie（{_preview(cookie_header)}）· 指纹={fp_id}"
         + (" · 已设密" if has_pwd else ""),
+    )
+    await _stock_session_invite(
+        item_id, sess, client, owner_email=email or sess.email or "", owner_ref=item_id
     )
     store.update_item(
         item_id,

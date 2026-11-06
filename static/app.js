@@ -1116,6 +1116,17 @@ async function pageChat() {
         const reader = r.body.getReader();
         const dec = new TextDecoder();
         let buf = '';
+        let streamError = '';
+        const take = (line) => {
+          const t = line.trim();
+          if (!t.startsWith('data:')) return;
+          const payload = t.slice(5).trim();
+          if (!payload || payload === '[DONE]') return;
+          const ev = JSON.parse(payload);
+          const delta = ev.choices && ev.choices[0] && (ev.choices[0].delta || ev.choices[0].message);
+          if (delta && typeof delta.content === 'string') { reply.content += delta.content; draw(); }
+          if (ev.error) streamError = (ev.error.message || JSON.stringify(ev.error));
+        };
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -1123,20 +1134,16 @@ async function pageChat() {
           const parts = buf.split('\n');
           buf = parts.pop();
           for (const line of parts) {
-            const t = line.trim();
-            if (!t.startsWith('data:')) continue;
-            const payload = t.slice(5).trim();
-            if (!payload || payload === '[DONE]') continue;
-            try {
-              const ev = JSON.parse(payload);
-              const delta = ev.choices && ev.choices[0] && (ev.choices[0].delta || ev.choices[0].message);
-              if (delta && typeof delta.content === 'string') { reply.content += delta.content; draw(); }
-              if (ev.error) throw new Error(ev.error.message || JSON.stringify(ev.error));
-            } catch (_) {}
+            try { take(line); } catch (e) { if (!(e instanceof SyntaxError)) streamError = String(e.message || e); }
           }
+          if (streamError) break;
+        }
+        if (buf.trim()) {
+          try { take(buf); } catch (e) { if (!(e instanceof SyntaxError)) streamError = String(e.message || e); }
         }
         reply.streaming = false;
         draw();
+        if (streamError) throw new Error(streamError);
       }
       if (!reply.content) { reply.content = '（空回复）'; draw(); }
     } catch (e) {
@@ -1444,7 +1451,7 @@ async function pageSettings() {
   ]);
   tab('net', '代理与结果', '出口代理列表与生成结果回传方式', IC.net, [
     card('代理与结果模式', '注册与生成请求使用的出口代理，以及结果的交付方式', `<div class="form-grid">
-      <div class="span2"><label class="f">代理列表（每行一个，支持 http/socks5，可含账号，支持 {sid} 占位）</label>
+      <div class="span2"><label class="f">代理列表（每行一个，支持 http/socks5，可含账号，支持 {sid} 占位；没写协议时按 SOCKS5）</label>
         <textarea id="proxies" style="min-height:110px" placeholder="us.udealproxy.com:6666:userId-7992-region-us-session-{sid}-sessTime-5:自己的密码&#10;socks5h://user:pass@host:3010&#10;支持 host:port:user:pass / user:pass@host:port / 完整 URL，{sid} 自动换会话">${esc(s.proxies || '')}</textarea>
         <div class="chips" style="margin-top:8px"><button class="btn" id="ptest">测试代理</button><span class="hint" style="margin:0" id="ptestres"></span></div></div>
       <div class="span2"><label class="f">生成结果模式 result_mode</label>

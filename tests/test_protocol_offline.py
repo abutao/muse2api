@@ -122,12 +122,23 @@ class ProxyParseTests(unittest.TestCase):
         self.assertEqual(out["username"], "dave")
         self.assertEqual(out["password"], "se:cret")
 
-    def test_signup_normalize_entry_default_http(self):
+    def test_signup_normalize_entry_default_socks(self):
         url = normalize_proxy_entry("proxy.example.test:8080:erin:pw:with:colon")
-        self.assertTrue(url.startswith("http://"))
+        self.assertTrue(url.startswith("socks5h://"))
         self.assertIn("@proxy.example.test:8080", url)
         # password with colons must be percent-encoded once in the synthesized URL
         self.assertIn("erin:", url)
+
+    def test_signup_normalize_keeps_sid_placeholder(self):
+        url = normalize_proxy_entry("user-sid-{sid}-t-5:secret@us.example.test:3010")
+        self.assertTrue(url.startswith("socks5h://"))
+        self.assertIn("{sid}", url)
+        self.assertNotIn("%7B", url)
+
+    def test_signup_normalize_explicit_http(self):
+        url = normalize_proxy_entry("proxy.example.test:8080:erin:pw:http")
+        self.assertTrue(url.startswith("http://"))
+        self.assertIn("@proxy.example.test:8080", url)
 
 
 if __name__ == "__main__":

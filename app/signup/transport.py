@@ -127,6 +127,19 @@ async def send(
                 target=target,
             )
         except Exception as exc:  # noqa: BLE001
+            # A connect/read timeout means this sticky SID is dead. Raise at once
+            # so the caller can mint a new SID, instead of waiting out httpx too.
+            blob = f"{type(exc).__name__} {exc}".lower()
+            dead_sid = proxy and any(
+                k in blob
+                for k in ("timed out", "timeout", "curl: (28)", "connecterror", "connection refused")
+            )
+            if dead_sid:
+                logger.warning(
+                    "proxy sid unreachable (%s); caller will rotate",
+                    type(exc).__name__,
+                )
+                raise
             # libcurl-impersonate can fail on some SOCKS5 proxies / h2 edge cases;
             # fall back to httpx (socksio) rather than failing the whole flow.
             logger.warning(

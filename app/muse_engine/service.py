@@ -516,14 +516,17 @@ def local_models() -> dict[str, Any]:
 
 
 def _proxy_server_for(aid: str) -> str:
-    """账号自己的出口；没有就从系统代理里抽一条新 SID。直连会被地区门挡住。"""
+    """每次检测/分配都换一条新 SID。账号上存的旧出口经常已经失效。"""
+    from app.config import get_settings
+    from app.signup.protocol import fresh_sticky_proxy, pick_proxy
+
+    fresh = fresh_sticky_proxy()
+    if fresh:
+        return fresh
     proxy = pool_store.get_proxy(aid) or {}
     server = str(proxy.get("server") or "").strip()
     if server:
         return server
-    from app.config import get_settings
-    from app.signup.protocol import pick_proxy
-
     return pick_proxy(getattr(get_settings(), "proxies", "") or "") or ""
 
 
@@ -594,7 +597,7 @@ def test_account_session(aid: str) -> dict[str, Any]:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("lease workspace %s failed: %s", aid, exc)
-        if server and not (pool_store.get_proxy(aid) or {}).get("server"):
+        if server:
             pool_store.update(aid, proxy={"server": server})
         pool_store.apply_session_renewal(
             aid,

@@ -282,6 +282,19 @@ CREATE TABLE IF NOT EXISTS pool_account_meta (
 
 CREATE INDEX IF NOT EXISTS idx_pool_meta_email ON pool_account_meta(email);
 CREATE INDEX IF NOT EXISTS idx_pool_meta_signup ON pool_account_meta(signup_item_id);
+
+CREATE TABLE IF NOT EXISTS invite_codes (
+    code TEXT PRIMARY KEY,
+    owner_email TEXT NOT NULL DEFAULT '',
+    owner_ref TEXT NOT NULL DEFAULT '',
+    max_uses INTEGER NOT NULL DEFAULT 30,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    uses_remaining INTEGER NOT NULL DEFAULT 30,
+    status TEXT NOT NULL DEFAULT 'active',
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_invite_codes_status ON invite_codes(status, uses_remaining);
 """
 
 _CALL_LOG_EXTRA = [

@@ -71,6 +71,28 @@ logger = logging.getLogger("muse-proxy.signup.protocol")
 _PROXY_SCHEMES = ("http://", "https://", "socks4://", "socks4a://", "socks5://", "socks5h://")
 
 
+def _declared_proxy_scheme(raw: str) -> str | None:
+    """Scheme the user actually wrote. Scheme-less lines return None."""
+    low = raw.lower()
+    for prefix in _PROXY_SCHEMES:
+        if low.startswith(prefix):
+            return prefix.split("://", 1)[0]
+    exact = raw.split(":")
+    schemes = ("http", "https", "socks4", "socks5", "socks5h")
+    if (
+        len(exact) == 5
+        and exact[1].isdigit()
+        and exact[4].strip().lower() in schemes
+        and not exact[0].startswith("[")
+    ):
+        return exact[4].strip().lower()
+    if raw.startswith("["):
+        tail = raw.split("]")[-1].lstrip(":").split(":")
+        if len(tail) == 4 and tail[0].isdigit() and tail[3].strip().lower() in schemes:
+            return tail[3].strip().lower()
+    return None
+
+
 def normalize_proxy_entry(entry: str) -> str:
     """Accept common provider formats and turn them into a URL.
 
@@ -78,9 +100,14 @@ def normalize_proxy_entry(entry: str) -> str:
       * ``http(s)/socks URL`` (kept as-is; userinfo is not re-encoded)
       * ``user:pass@host:port``
       * ``host:port``
-      * ``host:port:user:pass`` (default scheme http; password may contain ``:``)
+      * ``host:port:user:pass`` (password may contain ``:``)
       * ``host:port:user:pass:socks5`` (exact 5 fields when password has no ``:``)
       * ``[ipv6]:port:user:pass``
+
+    A line with no scheme defaults to ``socks5h``. Residential exits used by
+    signup (arxlabs ``:3010`` and similar) speak SOCKS5; treating them as HTTP
+    connects then hangs. ``{sid}`` is left intact so a later expand can mint
+    a fresh sticky session.
     """
     raw = (entry or "").strip()
     if not raw:
@@ -88,6 +115,7 @@ def normalize_proxy_entry(entry: str) -> str:
     low = raw.lower()
     if low.startswith(_PROXY_SCHEMES):
         return raw
+    declared = _declared_proxy_scheme(raw)
     try:
         from app.muse_engine.browser_proxy import parse_proxy_string
         from urllib.parse import quote, urlsplit
@@ -96,14 +124,17 @@ def normalize_proxy_entry(entry: str) -> str:
         if not parsed:
             return ""
         parts = urlsplit(parsed["server"])
+        scheme = parts.scheme if declared else "socks5h"
         user = parsed.get("username")
         pwd = parsed.get("password")
         if user is None and pwd is None:
-            return parsed["server"]
-        auth = quote(str(user or ""), safe="") + ":" + quote(str(pwd or ""), safe="")
-        return f"{parts.scheme}://{auth}@{parts.netloc}"
+            return f"{scheme}://{parts.netloc}"
+        # Keep `{sid}` literal. quote() would turn it into %7Bsid%7D and the
+        # sticky-session expander would never see the placeholder.
+        auth = quote(str(user or ""), safe="{}") + ":" + quote(str(pwd or ""), safe="{}")
+        return f"{scheme}://{auth}@{parts.netloc}"
     except Exception:
-        scheme = "http"
+        scheme = declared or "socks5h"
         exact = raw.split(":")
         if len(exact) == 5 and exact[1].isdigit() and exact[4].strip().lower() in (
             "http", "https", "socks4", "socks5", "socks5h"
@@ -948,7 +979,9 @@ class HttpMuseClient:
             headers["cookie"] = cookie
         res = None
         proxy = ""
-        for attempt in range(3):
+        # A dead sticky SID times out; mint a new one and try again.
+        proxy_tries = 6
+        for attempt in range(proxy_tries):
             proxy = self._resolve_proxy(sess)
             try:
                 res = await http_send(
@@ -961,7 +994,7 @@ class HttpMuseClient:
                     follow_redirects=False,
                 )
             except Exception as exc:  # noqa: BLE001 — curl_cffi + httpx
-                if attempt < 2 and _proxyish(exc) and _rotate_proxy(sess, attempt + 1):
+                if attempt < proxy_tries - 1 and _proxyish(exc) and _rotate_proxy(sess, attempt + 1):
                     continue
                 kind = "proxy_error" if isinstance(exc, httpx.ProxyError) else "transport_error"
                 raise MuseProtocolError(
@@ -974,7 +1007,7 @@ class HttpMuseClient:
                         "url": url,
                     },
                 ) from exc
-            if res.status_code in (407, 502, 503, 504) and attempt < 2 and _rotate_proxy(sess, attempt + 1):
+            if res.status_code in (407, 502, 503, 504) and attempt < proxy_tries - 1 and _rotate_proxy(sess, attempt + 1):
                 continue
             break
         assert res is not None
