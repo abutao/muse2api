@@ -237,9 +237,7 @@ curl -b cj -X POST http://127.0.0.1:8090/api/cards/import \
 
 使用时请自行遵守所在地法律，以及 Muse 等上游服务的条款。不要把它用于未授权访问、批量注册滥用、诈骗或其他侵害他人权益的行为。`app/muse_engine` 内若另有许可文本，以该目录中的声明为准。
 
-## 友链
-
-- [**LinuxDO**](https://linux.do) — LINUX DO，一个面向技术爱好者的社区
+技术交流：727682537
 
 ## Star
 
